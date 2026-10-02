@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check . && ruff format --check .
+      - run: pytest -q -rs   # moto（DynamoDB の模擬）と slack_bolt のテストも実行される
+
+  dynamodb-local:
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:2.5.2
+        ports:
+          - 8000:8000
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: create tables on DynamoDB Local (twice, idempotent)
+        env:
+          AWS_ACCESS_KEY_ID: local
+          AWS_SECRET_ACCESS_KEY: local
+        run: |
+          python scripts/create_tables.py --endpoint http://localhost:8000
+          python scripts/create_tables.py --endpoint http://localhost:8000
+      - name: round trip
+        env:
+          AWS_ACCESS_KEY_ID: local
+          AWS_SECRET_ACCESS_KEY: local
+        run: |
+          python - <<'PY'
+          from datetime import date
+          from agenda_bot import service
+          from agenda_bot.repository import DynamoRepository
+          repo = DynamoRepository(endpoint_url="http://localhost:8000")
+          m = service.register_meeting(repo, "C1", "UO", "定例", 0, "10:00", 30)
+          service.add_draft(repo, m, date(2026, 10, 2), "議題", "", 10, "", "UA")
+          v = service.agenda(repo, m, date(2026, 10, 2))
+          assert [r["title"] for r in v.rows] == ["議題"], v.rows
+          print(v.markdown)
+          PY

@@ -1,0 +1,24 @@
+# Slack アプリのマニフェスト（https://api.slack.com/apps → Create New App → From a manifest に貼る）
+display_information:
+  name: アジェンダ係
+  description: 定例会議の議題を集めて Canvas にまとめます
+features:
+  bot_user:
+    display_name: アジェンダ係
+    always_online: false
+  slash_commands:
+    - command: /agenda
+      description: 議題を出す・次回のアジェンダを見る・Canvas に出す
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - commands          # /agenda
+      - chat:write        # 登録・議題の通知
+      - canvases:write    # Canvas の作成と更新
+settings:
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true   # 公開 URL 無しで動く（社内 PC・コンテナから接続）
+  org_deploy_enabled: false
+  token_rotation_enabled: false

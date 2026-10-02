@@ -1,0 +1,12 @@
+# ローカル開発用の DynamoDB Local（データは local/data に残る）
+#   docker compose -f local/docker-compose.yml up -d
+#   python scripts/create_tables.py
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/home/dynamodblocal/data
+    user: root

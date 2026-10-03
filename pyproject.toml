@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "slack-agenda-bot"
 version = "0.1.0"
 description = "定例会議のアジェンダを Slack（/agenda）で集め、固定の議題と合わせて Canvas にまとめるボット（Bolt・Socket Mode・DynamoDB）"
+license = "MIT"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["slack_bolt>=1.18", "boto3>=1.34"]

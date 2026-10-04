@@ -1,0 +1,10 @@
+# 依存の更新を月 1 回、PR で提案する（マージ前に CI とレビューを通す）
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: monthly}
+  - package-ecosystem: pip
+    directory: /
+    schedule: {interval: monthly}
+    open-pull-requests-limit: 5

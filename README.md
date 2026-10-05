@@ -43,3 +43,8 @@ ruff check . && ruff format --check . && pytest
 
 テストは保存先をメモリと moto（DynamoDB の模擬）、Slack を偽のクライアントにして動き、外部には接続しません。
 CI では DynamoDB Local のコンテナでもテーブルの作成と読み書きを確かめます。
+
+## セキュリティ・ライセンス
+
+- 脆弱性を見つけたら、公開の Issue ではなく [SECURITY.md](SECURITY.md) の方法で知らせてください
+- ライセンスは [MIT](LICENSE) です

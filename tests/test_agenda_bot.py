@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
 from agenda_bot import service, views
-from agenda_bot.model import DraftItem, Meeting, build_agenda
+from agenda_bot.model import CanvasRecord, DraftItem, Meeting, build_agenda
 from agenda_bot.repository import TABLES, MemoryRepository
 
 TODAY = date(2026, 10, 2)  # 金曜
@@ -169,3 +169,48 @@ def test_app_wiring_registers_handlers(repo):
 
     app = build_app(repo, token="xoxb-test", token_verification_enabled=False)
     assert len(app._listeners) == 10  # /agenda 1、ボタン 6、モーダル 3
+
+
+# --- タイムゾーン: サーバーが UTC でも、設定したタイムゾーン（既定は Asia/Tokyo）の日付を使う ---
+
+FROZEN_UTC = datetime(2026, 10, 6, 23, 30, tzinfo=UTC)  # = 2026-10-07（水）08:30 JST
+
+
+@pytest.fixture()
+def frozen(monkeypatch):
+    from agenda_bot import clock
+
+    monkeypatch.setattr(clock, "_utcnow", lambda: FROZEN_UTC)
+    monkeypatch.delenv("TIMEZONE", raising=False)
+    return clock
+
+
+def test_today_uses_jst_by_default(frozen):
+    assert frozen.today() == date(2026, 10, 7)  # UTC ではまだ 10/6
+    assert frozen.now().isoformat(timespec="seconds") == "2026-10-07T08:30:00+09:00"
+
+
+def test_timezone_from_env_and_argument(frozen, monkeypatch):
+    monkeypatch.setenv("TIMEZONE", "UTC")
+    assert frozen.today() == date(2026, 10, 6)
+    assert frozen.today("Asia/Tokyo") == date(2026, 10, 7)
+    monkeypatch.setenv("TIMEZONE", "Mars/Olympus")
+    with pytest.raises(ValueError, match="TIMEZONE"):
+        frozen.today()
+
+
+def test_next_meeting_uses_jst_date_on_utc_server(frozen, repo):
+    m = service.register_meeting(repo, "C1", "UO", "火曜定例", 1, "10:00", 30)  # 火曜
+    # JST では 10/7（水）なので次回は 10/13（火）。UTC の日付（10/6 火）だと誤って 10/6 になる
+    assert service.agenda(repo, m, frozen.today()).meeting_date == date(2026, 10, 13)
+    d = service.add_draft(repo, m, frozen.today(), "議題", "", 10, "", "UA")
+    assert d.meeting_date == "2026-10-13"
+    assert d.created_at == "2026-10-07T08:30:00+09:00"
+    assert CanvasRecord("m", "2026-10-13", "F").updated_at == "2026-10-07T08:30:00+09:00"
+
+
+def test_app_today_uses_timezone(frozen):
+    from agenda_bot.app import today_in
+
+    assert today_in()() == date(2026, 10, 7)
+    assert today_in("UTC")() == date(2026, 10, 6)

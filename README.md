@@ -23,10 +23,13 @@
 2. [docs/setup.md](docs/setup.md) の手順で Slack アプリを作り、`.env` にトークンを書く
 3. `agenda-bot` で起動し、チャンネルで `/agenda` → 「会議を登録する」
 
+次の開催日は `.env` の `TIMEZONE`（既定は `Asia/Tokyo`）の日付で決めます。サーバーの時計が UTC でも、日本時間の 0〜9 時に前日扱いになりません。
+
 ## 構成
 
 | ファイル | 役割 |
 |---|---|
+| `src/agenda_bot/clock.py` | 「今日」と「今」（設定したタイムゾーン。既定は Asia/Tokyo） |
 | `src/agenda_bot/model.py` | 会議・議題とアジェンダの組み立て（会議時間で切る・Markdown にする） |
 | `src/agenda_bot/service.py` | ユースケース（登録・議題の追加と取り下げ・アジェンダ・Canvas への出力）。入力のチェック |
 | `src/agenda_bot/views.py` | Slack の画面（Block Kit・モーダル） |

@@ -9,7 +9,7 @@ description = "定例会議のアジェンダを Slack（/agenda）で集め、�
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["slack_bolt>=1.18", "boto3>=1.34"]
+dependencies = ["slack_bolt>=1.18", "boto3>=1.34", "tzdata; sys_platform == 'win32'"]  # Windows はタイムゾーンのデータを持たないため tzdata
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6", "moto[dynamodb]>=5.0"]

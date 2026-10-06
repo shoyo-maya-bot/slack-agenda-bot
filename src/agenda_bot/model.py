@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
+
+from . import clock
 
 WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -24,7 +26,7 @@ class Meeting:
     default_minutes: int = 60
 
     def next_date(self, today: date) -> date:
-        """今日を含めて次の開催日."""
+        """今日（設定したタイムゾーンの日付. clock.today()）を含めて次の開催日."""
         return today + timedelta(days=(self.weekday - today.weekday()) % 7)
 
 
@@ -52,7 +54,7 @@ class DraftItem:
     minutes: int = 10
     presenter: str = ""  # Slack のユーザー ID
     created_by: str = ""
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    created_at: str = field(default_factory=lambda: clock.now().isoformat(timespec="seconds"))
     status: str = "proposed"  # proposed / accepted / deferred
 
 
@@ -61,7 +63,7 @@ class CanvasRecord:
     meeting_id: str
     meeting_date: str
     canvas_id: str
-    updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    updated_at: str = field(default_factory=lambda: clock.now().isoformat(timespec="seconds"))
 
 
 def to_dict(obj) -> dict:

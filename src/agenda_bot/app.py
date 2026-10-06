@@ -1,15 +1,16 @@
 """Slack との結合部（Bolt・Socket Mode）. 処理は service、画面は views に置き、ここは受け渡しだけ.
 
-python -m agenda_bot        # .env の SLACK_BOT_TOKEN / SLACK_APP_TOKEN と DynamoDB の設定で起動
+python -m agenda_bot        # .env の SLACK_BOT_TOKEN / SLACK_APP_TOKEN・TIMEZONE と DynamoDB の設定で起動
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from datetime import date
 
-from . import service, views
+from . import clock, service, views
 from .repository import DynamoRepository, Repository
 
 log = logging.getLogger("agenda_bot")
@@ -25,8 +26,23 @@ def load_env(path: str = ".env") -> None:
             os.environ.setdefault(k.strip(), v.strip().strip('"'))
 
 
-def build_app(repo: Repository, *, token: str, canvas_mode: str = "standalone", today=date.today, **app_kwargs):
+def today_in(tz: str | None = None) -> Callable[[], date]:
+    """設定したタイムゾーン（tz → 環境変数 TIMEZONE → Asia/Tokyo）の「今日」を返す関数."""
+    return lambda: clock.today(tz)
+
+
+def build_app(
+    repo: Repository,
+    *,
+    token: str,
+    canvas_mode: str = "standalone",
+    today: Callable[[], date] | None = None,
+    tz: str | None = None,
+    **app_kwargs,
+):
     from slack_bolt import App
+
+    today = today or today_in(tz)
 
     app = App(token=token, **app_kwargs)
 
@@ -155,6 +171,8 @@ def build_app(repo: Repository, *, token: str, canvas_mode: str = "standalone", 
 def main() -> None:
     load_env()
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+    tz = clock.get_tz()  # 名前の誤りは起動時に止める
+    log.info("timezone: %s", tz.key)
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     repo = DynamoRepository(
@@ -162,5 +180,5 @@ def main() -> None:
         endpoint_url=os.environ.get("DYNAMODB_ENDPOINT") or None,
         region=os.environ.get("AWS_REGION", "ap-northeast-1"),
     )
-    app = build_app(repo, token=os.environ["SLACK_BOT_TOKEN"], canvas_mode=os.environ.get("CANVAS_MODE", "standalone"))
+    app = build_app(repo, token=os.environ["SLACK_BOT_TOKEN"], canvas_mode=os.environ.get("CANVAS_MODE", "standalone"), tz=tz.key)
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()

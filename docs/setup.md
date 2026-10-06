@@ -20,6 +20,18 @@ Canvas を API で作る・更新するには Slack の **有料プラン** が�
 | `channel` | チャンネルの Canvas（1 チャンネル 1 つ）を毎回置き換える | 有料プラン、`canvases:write`。チャンネルに Canvas が既にあると `channel_canvas_already_exists` |
 | `standalone` | 開催日ごとに Canvas を作り、チャンネルに編集権限を付ける | 有料プラン、`canvases:write` |
 
+### タイムゾーン
+
+「今日」と次の開催日、議題を出した時刻は `.env` の `TIMEZONE` で決めます（IANA の名前。未設定なら `Asia/Tokyo`）。
+サーバー（ECS・EC2 など）の時計が UTC でも、この設定の日付で動きます。
+
+| TIMEZONE | 使いどころ |
+|---|---|
+| `Asia/Tokyo`（既定） | 日本の会議 |
+| `America/New_York` など | ほかの地域の会議（ボット 1 つにつき 1 つのタイムゾーン） |
+
+名前を間違えると起動時に止まります。Windows は `pip install` で `tzdata` も入ります。
+
 ## 2. DynamoDB
 
 ### ローカル（DynamoDB Local）

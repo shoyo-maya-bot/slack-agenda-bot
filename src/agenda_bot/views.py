@@ -13,9 +13,18 @@ A_FIXED = "agenda_fixed"
 A_CANVAS = "agenda_canvas"
 A_REGISTER = "agenda_register"
 A_REMOVE_DRAFT = "agenda_remove_draft"
+A_DELETE_FIXED = "agenda_delete_fixed"
 V_REGISTER = "agenda_view_register"
 V_DRAFT = "agenda_view_draft"
 V_FIXED = "agenda_view_fixed"
+
+
+def esc(text: str) -> str:
+    """利用者の文字列を Slack の mrkdwn（メッセージ・セクション）に入れる前に無害化する.
+
+    & < > をエスケープし、<!channel>・<!here>・<@U…>・<#C…> などの特殊な書式（一斉メンションなど）にならないようにする。
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _btn(text: str, action: str, value: str, style: str = "") -> dict[str, Any]:
@@ -59,7 +68,7 @@ def menu(meetings: list[Meeting]) -> list[dict[str, Any]]:
         blocks += [
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*{m.name}*（毎週{WEEKDAYS[m.weekday]}曜 {m.time}〜、{m.default_minutes} 分）"},
+                "text": {"type": "mrkdwn", "text": f"*{esc(m.name)}*（毎週{WEEKDAYS[m.weekday]}曜 {m.time}〜、{m.default_minutes} 分）"},
             },
             {
                 "type": "actions",
@@ -100,7 +109,7 @@ def draft_modal(meeting: Meeting, meeting_date: str) -> dict[str, Any]:
         "title": {"type": "plain_text", "text": "議題を出す"},
         "submit": {"type": "plain_text", "text": "出す"},
         "blocks": [
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"{meeting.name}（{meeting_date}）に向けた議題"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"{esc(meeting.name)}（{meeting_date}）に向けた議題"}]},
             _input("title", "議題", _text("v", placeholder="例: リリース日の判断")),
             _input("detail", "補足（決めたいこと・資料のリンク）", _text("v", multiline=True), optional=True),
             _input("minutes", "時間（分）", _text("v", "10")),
@@ -109,20 +118,35 @@ def draft_modal(meeting: Meeting, meeting_date: str) -> dict[str, Any]:
     }
 
 
-def fixed_modal(meeting: Meeting, items: list) -> dict[str, Any]:
-    listing = "\n".join(f"• {f.title}（{f.minutes} 分）" for f in sorted(items, key=lambda x: x.order)) or "（まだありません）"
-    return {
+def fixed_modal(meeting: Meeting, items: list, can_manage: bool = True) -> dict[str, Any]:
+    """固定の議題の一覧（削除ボタン付き）と追加の入力欄. can_manage=False なら一覧だけ（追加・削除できない）."""
+    blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{esc(meeting.name)} の毎回の議題*"}}]
+    for f in sorted(items, key=lambda x: x.order):
+        sec: dict[str, Any] = {"type": "section", "text": {"type": "mrkdwn", "text": f"• {esc(f.title)}（{f.minutes} 分）"}}
+        if can_manage:
+            sec["accessory"] = _btn("削除", A_DELETE_FIXED, f"{meeting.meeting_id}|{f.item_id}", "danger")
+        blocks.append(sec)
+    if not items:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "（まだありません）"}})
+    modal: dict[str, Any] = {
         "type": "modal",
         "callback_id": V_FIXED,
         "private_metadata": meeting.meeting_id,
         "title": {"type": "plain_text", "text": "固定の議題"},
-        "submit": {"type": "plain_text", "text": "追加"},
-        "blocks": [
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*{meeting.name} の毎回の議題*\n{listing}"}},
+        "close": {"type": "plain_text", "text": "閉じる"},
+        "blocks": blocks,
+    }
+    if can_manage:
+        modal["submit"] = {"type": "plain_text", "text": "追加"}
+        blocks += [
             _input("title", "追加する議題", _text("v", placeholder="例: 先週の振り返り")),
             _input("minutes", "時間（分）", _text("v", "5")),
-        ],
-    }
+        ]
+    else:
+        blocks.append(
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "固定の議題を変えられるのは、設定された担当者だけです。"}]}
+        )
+    return modal
 
 
 def agenda_blocks(view: AgendaView, user: str) -> list[dict[str, Any]]:
@@ -135,13 +159,19 @@ def agenda_blocks(view: AgendaView, user: str) -> list[dict[str, Any]]:
         {"type": "context", "elements": [{"type": "mrkdwn", "text": f"合計 {view.total} 分 ／ 会議時間 {m.default_minutes} 分"}]},
     ]
     for n, r in enumerate(view.rows, start=1):
-        who = f" <@{r['presenter']}>" if r["presenter"].startswith("U") else (f" {r['presenter']}" if r["presenter"] else "")
-        sec: dict[str, Any] = {"type": "section", "text": {"type": "mrkdwn", "text": f"{n}. *{r['title']}*（{r['minutes']} 分）{who}"}}
-        if r["kind"] == "議題":
+        who = f" <@{r['presenter']}>" if r["presenter"].startswith("U") else (f" {esc(r['presenter'])}" if r["presenter"] else "")
+        mark = "（繰越）" if r["kind"] == "繰越" else ""
+        sec: dict[str, Any] = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"{n}. *{esc(r['title'])}*{mark}（{r['minutes']} 分）{who}"},
+        }
+        if "item_id" in r:
             sec["accessory"] = _btn("取り下げ", A_REMOVE_DRAFT, f"{m.meeting_id}|{view.meeting_date.isoformat()}|{r['item_id']}")
         blocks.append(sec)
     if view.deferred:
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "次回へ: " + "、".join(d.title for d in view.deferred)}]})
+        blocks.append(
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "次回へ: " + "、".join(esc(d.title) for d in view.deferred)}]}
+        )
     if not view.rows:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "まだ議題がありません。"}})
     return blocks

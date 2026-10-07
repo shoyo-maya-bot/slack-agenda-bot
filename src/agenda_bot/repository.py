@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import fields
 from typing import Any, Protocol
 
@@ -34,7 +35,10 @@ class Repository(Protocol):
     def put_draft(self, d: DraftItem) -> None: ...
     def delete_draft(self, meeting_id: str, meeting_date: str, item_id: str) -> None: ...
     def drafts(self, meeting_id: str, meeting_date: str) -> list[DraftItem]: ...
+    def drafts_before(self, meeting_id: str, meeting_date: str) -> list[DraftItem]: ...
     def put_canvas(self, c: CanvasRecord) -> None: ...
+    def put_canvas_if(self, c: CanvasRecord, expected: CanvasRecord | None) -> bool: ...
+    def delete_canvas(self, meeting_id: str, meeting_date: str) -> None: ...
     def get_canvas(self, meeting_id: str, meeting_date: str) -> CanvasRecord | None: ...
 
 
@@ -46,6 +50,7 @@ def _build(cls, item: dict[str, Any]):
 class MemoryRepository:
     def __init__(self) -> None:
         self.t: dict[str, dict[tuple, dict]] = {k: {} for k in TABLES}
+        self._lock = threading.Lock()  # 条件付きの書き込み（put_canvas_if）を DynamoDB と同じく 1 回の操作にする
 
     def _put(self, table: str, item: dict) -> None:
         spec = TABLES[table]
@@ -83,8 +88,23 @@ class MemoryRepository:
     def drafts(self, meeting_id: str, meeting_date: str) -> list[DraftItem]:
         return [_build(DraftItem, v) for v in self._query("drafts", meeting_id, f"{meeting_date}#")]
 
+    def drafts_before(self, meeting_id: str, meeting_date: str) -> list[DraftItem]:
+        """meeting_date より前の開催日の議題（扱い済みの accepted を除く）."""
+        return [_build(DraftItem, v) for v in self._query("drafts", meeting_id) if v["sk"] < meeting_date and v.get("status") != "accepted"]
+
     def put_canvas(self, c: CanvasRecord) -> None:
         self._put("canvases", to_dict(c))
+
+    def put_canvas_if(self, c: CanvasRecord, expected: CanvasRecord | None) -> bool:
+        """今の記録が expected と同じ（None なら記録が無い）ときだけ書く. 書けたら True."""
+        with self._lock:
+            if self.get_canvas(c.meeting_id, c.meeting_date) != expected:
+                return False
+            self._put("canvases", to_dict(c))
+            return True
+
+    def delete_canvas(self, meeting_id: str, meeting_date: str) -> None:
+        self.t["canvases"].pop((meeting_id, meeting_date), None)
 
     def get_canvas(self, meeting_id: str, meeting_date: str) -> CanvasRecord | None:
         v = self.t["canvases"].get((meeting_id, meeting_date))
@@ -154,8 +174,46 @@ class DynamoRepository:
     def drafts(self, meeting_id: str, meeting_date: str) -> list[DraftItem]:
         return [_build(DraftItem, v) for v in self._query("drafts", meeting_id, f"{meeting_date}#")]
 
+    def drafts_before(self, meeting_id: str, meeting_date: str) -> list[DraftItem]:
+        """meeting_date より前の開催日の議題（扱い済みの accepted を除く）."""
+        from boto3.dynamodb.conditions import Attr, Key
+
+        kw: dict[str, Any] = {
+            "KeyConditionExpression": Key("meeting_id").eq(meeting_id) & Key("sk").lt(meeting_date),
+            "FilterExpression": Attr("status").ne("accepted"),
+        }
+        items: list[dict] = []
+        while True:
+            res = self.tables["drafts"].query(**kw)
+            items += res.get("Items", [])
+            if "LastEvaluatedKey" not in res:
+                return [_build(DraftItem, v) for v in items]
+            kw["ExclusiveStartKey"] = res["LastEvaluatedKey"]
+
     def put_canvas(self, c: CanvasRecord) -> None:
         self.tables["canvases"].put_item(Item=to_dict(c))
+
+    def put_canvas_if(self, c: CanvasRecord, expected: CanvasRecord | None) -> bool:
+        """今の記録が expected と同じ（None なら記録が無い）ときだけ書く（条件付き put）. 書けたら True."""
+        from botocore.exceptions import ClientError
+
+        if expected is None:
+            cond: dict[str, Any] = {"ConditionExpression": "attribute_not_exists(meeting_id)"}
+        else:
+            cond = {
+                "ConditionExpression": "canvas_id = :c AND updated_at = :u",
+                "ExpressionAttributeValues": {":c": expected.canvas_id, ":u": expected.updated_at},
+            }
+        try:
+            self.tables["canvases"].put_item(Item=to_dict(c), **cond)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
+
+    def delete_canvas(self, meeting_id: str, meeting_date: str) -> None:
+        self.tables["canvases"].delete_item(Key={"meeting_id": meeting_id, "meeting_date": meeting_date})
 
     def get_canvas(self, meeting_id: str, meeting_date: str) -> CanvasRecord | None:
         v = self.tables["canvases"].get_item(Key={"meeting_id": meeting_id, "meeting_date": meeting_date}).get("Item")

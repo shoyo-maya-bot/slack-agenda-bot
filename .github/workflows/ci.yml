@@ -18,9 +18,43 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev]"
+      # constraints.txt（deps-lock.yml が作る）があれば、版を固定して入れる
+      - run: if [ -f constraints.txt ]; then pip install -e ".[dev]" -c constraints.txt; else pip install -e ".[dev]"; fi
       - run: ruff check . && ruff format --check .
       - run: pytest -q -rs   # moto（DynamoDB の模擬）と slack_bolt のテストも実行される
+
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: if [ -f constraints.txt ]; then pip install -e ".[dev]" -c constraints.txt; else pip install -e ".[dev]"; fi
+      - run: pytest -q -rs
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: if [ -f constraints.txt ]; then pip install -e . -c constraints.txt; else pip install -e .; fi
+      - run: pip install "bandit==1.8.6" "pip-audit==2.9.0"
+      - name: SAST (bandit)
+        run: bandit -q -r src -ll
+      - name: Dependency vulnerabilities (pip-audit)
+        run: pip-audit --skip-editable --progress-spinner off
 
   dynamodb-local:
     runs-on: ubuntu-latest
@@ -36,7 +70,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - run: pip install -e .
+      - run: if [ -f constraints.txt ]; then pip install -e . -c constraints.txt; else pip install -e .; fi
       - name: create tables on DynamoDB Local (twice, idempotent)
         env:
           AWS_ACCESS_KEY_ID: local
@@ -58,5 +92,12 @@ jobs:
           service.add_draft(repo, m, date(2026, 10, 2), "議題", "", 10, "", "UA")
           v = service.agenda(repo, m, date(2026, 10, 2))
           assert [r["title"] for r in v.rows] == ["議題"], v.rows
+          # 条件付き put（Canvas の重複防止）と繰り越しのクエリも DynamoDB Local で確かめる
+          from agenda_bot.model import CanvasRecord
+          assert repo.put_canvas_if(CanvasRecord(m.meeting_id, "2026-10-05", ""), None) is True
+          assert repo.put_canvas_if(CanvasRecord(m.meeting_id, "2026-10-05", ""), None) is False
+          service.add_draft(repo, m, date(2026, 10, 2), "長い議題", "", 30, "", "UB")
+          v = service.agenda(repo, m, date(2026, 10, 6))
+          assert [(r["kind"], r["title"]) for r in v.rows] == [("繰越", "長い議題")], v.rows
           print(v.markdown)
           PY

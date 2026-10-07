@@ -1,0 +1,50 @@
+name: deps-lock
+
+# 依存の版を constraints.txt に固定する（pyproject.toml の dev を含む）。
+# 手元の環境から PyPI に届かないことがあるため、GitHub Actions で作り、変わっていれば同じブランチにコミットする。
+# GITHUB_TOKEN のコミットでは CI が走らないので、その後に次の変更を push して CI を走らせる。
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore: [main]
+    paths:
+      - pyproject.toml
+      - .github/workflows/deps-lock.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deps-lock-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # このジョブだけ、constraints.txt をコミットして push するために書き込み権限と認証情報を残す
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install "uv==0.8.17"
+      # --universal: Windows でだけ入る依存（tzdata）も、環境マーカー付きで含める
+      - name: compile constraints.txt
+        run: |
+          uv pip compile pyproject.toml --extra dev --universal --python-version 3.12 --no-header --quiet -o constraints.txt
+          sed -i '1i # pyproject.toml（extra: dev）から .github/workflows/deps-lock.yml が作る。手で直さない' constraints.txt
+      - name: commit if changed
+        run: |
+          if git diff --quiet -- constraints.txt && git ls-files --error-unmatch constraints.txt >/dev/null 2>&1; then
+            echo "constraints.txt は変わっていません"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add constraints.txt
+          git commit -m "chore: constraints.txt を更新（deps-lock）"
+          git push

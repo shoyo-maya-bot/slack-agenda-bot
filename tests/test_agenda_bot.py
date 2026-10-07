@@ -407,3 +407,14 @@ def test_remove_fixed(repo, meeting):
     assert buttons[0]["action_id"] == views.A_DELETE_FIXED and buttons[0]["value"].startswith(meeting.meeting_id + "|")
     readonly = views.fixed_modal(meeting, repo.fixed_items(meeting.meeting_id), can_manage=False)
     assert "submit" not in readonly and not any("accessory" in b for b in readonly["blocks"])
+
+
+def test_drafts_keep_order_with_coarse_clock(repo, meeting, monkeypatch):
+    # Windows の Python 3.12 のように時計の刻みが粗く、続けて出した議題が同じ時刻になっても、出した順に並ぶ
+    from agenda_bot import clock
+
+    monkeypatch.setattr(clock, "_utcnow", lambda: datetime(2026, 10, 2, 1, 0, tzinfo=UTC))
+    titles = [f"議題{i}" for i in range(6)]
+    for t in titles:
+        service.add_draft(repo, meeting, TODAY, t, "", 5, "", "UA")
+    assert [r["title"] for r in service.agenda(repo, meeting, TODAY).rows] == titles

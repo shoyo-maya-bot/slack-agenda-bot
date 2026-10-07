@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -13,6 +14,28 @@ WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
 
 def new_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+_created_lock = threading.Lock()
+_last_created: list[datetime] = []
+
+
+def created_at() -> str:
+    """議題を出した時刻（ISO 形式）. 出した順に並べるのに使う.
+
+    Windows の Python 3.12 などは時計の刻みが粗く（約 15 ms）、続けて出した議題が同じ時刻になることがある。
+    直前（1 秒以内）に出した時刻以下なら 1 マイクロ秒ずらして、同じプロセスの中では必ず後の時刻にする。
+    """
+    t = clock.now()
+    with _created_lock:
+        if _last_created:
+            last = _last_created[0]
+            if last - timedelta(seconds=1) < t <= last:
+                t = last + timedelta(microseconds=1)
+            _last_created[0] = t
+        else:
+            _last_created.append(t)
+    return t.isoformat()
 
 
 @dataclass
@@ -68,7 +91,7 @@ class DraftItem:
     presenter: str = ""  # Slack のユーザー ID
     created_by: str = ""
     # 出した順に並べるため、マイクロ秒まで持つ（同じ秒に出た議題の順が保存先の都合で入れ替わらないように）
-    created_at: str = field(default_factory=lambda: clock.now().isoformat())
+    created_at: str = field(default_factory=created_at)
     status: str = "proposed"  # proposed（出された）/ accepted（開催日に扱った）/ deferred（前の会議から繰り越した）
     carried_from: str = ""  # 繰り越した議題の、最初の開催日（YYYY-MM-DD）
 

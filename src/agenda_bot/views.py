@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .model import WEEKDAYS, Meeting
+from .model import WEEKDAYS, Meeting, is_user_id
 from .service import AgendaView
 
 A_ADD_DRAFT = "agenda_add_draft"
@@ -19,6 +19,29 @@ A_CANCEL = "agenda_cancel"
 V_REGISTER = "agenda_view_register"
 V_DRAFT = "agenda_view_draft"
 V_FIXED = "agenda_view_fixed"
+
+# Slack の上限（Block Kit）. 超えると invalid_blocks で投稿・表示そのものが失敗する
+MAX_MESSAGE_BLOCKS = 50  # メッセージ（chat.postMessage・respond）のブロック数
+MAX_MODAL_BLOCKS = 100  # モーダルのブロック数
+MAX_TEXT = 3000  # section・context の mrkdwn の文字数
+
+
+def clip(text: str, limit: int = MAX_TEXT) -> str:
+    """文字数の上限に収める（超えたら末尾を「…」にする）."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def join_within(items: list[str], prefix: str = "", sep: str = "、", limit: int = MAX_TEXT) -> str:
+    """prefix の後ろに items を sep でつなぐ. limit 文字に収まらない分は「ほか N 件」にまとめる."""
+    out = prefix
+    for i, item in enumerate(items):
+        piece = (sep if i else "") + item
+        after = len(items) - i - 1
+        reserve = len(f"{sep}ほか {after} 件") if after else 0  # 次が入らなかったときの「ほか N 件」の分を残す
+        if len(out) + len(piece) + reserve > limit:
+            return clip(out + (sep if i else "") + f"ほか {len(items) - i} 件", limit)
+        out += piece
+    return out
 
 
 def esc(text: str) -> str:
@@ -66,7 +89,9 @@ def menu(meetings: list[Meeting]) -> list[dict[str, Any]]:
             {"type": "actions", "elements": [_btn("会議を登録する", A_REGISTER, "new", "primary")]},
         ]
     blocks: list[dict[str, Any]] = []
-    for m in meetings:
+    room = (MAX_MESSAGE_BLOCKS - 2) // 3  # 1 会議 3 ブロック. 末尾の「別の会議を登録する」と「ほか N 件」の分を残す
+    shown = meetings if len(meetings) * 3 + 1 <= MAX_MESSAGE_BLOCKS else meetings[:room]
+    for m in shown:
         blocks += [
             {
                 "type": "section",
@@ -83,6 +108,9 @@ def menu(meetings: list[Meeting]) -> list[dict[str, Any]]:
             },
             {"type": "divider"},
         ]
+    if len(shown) < len(meetings):
+        names = [esc(m.name) for m in meetings[len(shown) :]]
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": join_within(names, "表示しきれない会議: ")}]})
     blocks.append({"type": "actions", "elements": [_btn("別の会議を登録する", A_REGISTER, "new")]})
     return blocks
 
@@ -123,11 +151,18 @@ def draft_modal(meeting: Meeting, meeting_date: str) -> dict[str, Any]:
 def fixed_modal(meeting: Meeting, items: list, can_manage: bool = True) -> dict[str, Any]:
     """固定の議題の一覧（削除ボタン付き）と追加の入力欄. can_manage=False なら一覧だけ（追加・削除できない）."""
     blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{esc(meeting.name)} の毎回の議題*"}}]
-    for f in sorted(items, key=lambda x: x.order):
+    ordered = sorted(items, key=lambda x: x.order)
+    # 見出し・追加の入力欄 2 つ・結果の表示（delete_fixed が先頭に足す）・「ほか N 件」の分を残す
+    room = MAX_MODAL_BLOCKS - 5
+    shown, hidden = (ordered, []) if len(ordered) <= room + 1 else (ordered[:room], ordered[room:])
+    for f in shown:
         sec: dict[str, Any] = {"type": "section", "text": {"type": "mrkdwn", "text": f"• {esc(f.title)}（{f.minutes} 分）"}}
         if can_manage:
             sec["accessory"] = _btn("削除", A_DELETE_FIXED, f"{meeting.meeting_id}|{f.item_id}", "danger")
         blocks.append(sec)
+    if hidden:
+        text = join_within([esc(f.title) for f in hidden], f"表示しきれない固定の議題（{len(hidden)} 件）: ")
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text}]})
     if not items:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "（まだありません）"}})
     modal: dict[str, Any] = {
@@ -179,38 +214,54 @@ def settle_blocks(view: AgendaView, can_manage: bool) -> list[dict[str, Any]]:
     return blocks
 
 
-def agenda_blocks(view: AgendaView, user: str, can_manage: bool | None = None) -> list[dict[str, Any]]:
+def agenda_blocks(
+    view: AgendaView, user: str, can_manage: bool | None = None, max_blocks: int = MAX_MESSAGE_BLOCKS
+) -> list[dict[str, Any]]:
     """アジェンダの表示.
 
     can_manage が None（チャンネルへの投稿など）なら確定・中止の案内を出さない。True ならボタンも、False なら案内だけ出す。
+    ブロック数は max_blocks（既定はメッセージの上限 50）に収める. 議題が多すぎるときは、収まらない分を「ほか N 件」にまとめる。
     """
     m = view.meeting
-    blocks: list[dict[str, Any]] = [
+    head: list[dict[str, Any]] = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"{m.name} {view.meeting_date.isoformat()}（{WEEKDAYS[view.meeting_date.weekday()]}）"},
+            "text": {
+                "type": "plain_text",
+                "text": clip(f"{m.name} {view.meeting_date.isoformat()}（{WEEKDAYS[view.meeting_date.weekday()]}）", 150),
+            },
         },
         {"type": "context", "elements": [{"type": "mrkdwn", "text": f"合計 {view.total} 分 ／ 会議時間 {m.default_minutes} 分"}]},
     ]
-    for n, r in enumerate(view.rows, start=1):
-        who = f" <@{r['presenter']}>" if r["presenter"].startswith("U") else (f" {esc(r['presenter'])}" if r["presenter"] else "")
+    tail: list[dict[str, Any]] = []
+    if view.deferred:
+        text = join_within([esc(d.title) for d in view.deferred], "次回へ: ")
+        tail.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text}]})
+    if not view.rows:
+        tail.append({"type": "section", "text": {"type": "mrkdwn", "text": "まだ議題がありません。"}})
+    if can_manage is not None:
+        tail += settle_blocks(view, can_manage)
+    room = max_blocks - len(head) - len(tail)
+    rows = view.rows if len(view.rows) <= room else view.rows[: max(room - 1, 0)]
+    body: list[dict[str, Any]] = []
+    for n, r in enumerate(rows, start=1):
+        who = f" <@{r['presenter']}>" if is_user_id(r["presenter"]) else (f" {esc(r['presenter'])}" if r["presenter"] else "")
         mark = "（繰越）" if r["kind"] == "繰越" else ""
         sec: dict[str, Any] = {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"{n}. *{esc(r['title'])}*{mark}（{r['minutes']} 分）{who}"},
+            "text": {"type": "mrkdwn", "text": clip(f"{n}. *{esc(r['title'])}*{mark}（{r['minutes']} 分）{who}")},
         }
         if "item_id" in r:
             sec["accessory"] = _btn("取り下げ", A_REMOVE_DRAFT, f"{m.meeting_id}|{view.meeting_date.isoformat()}|{r['item_id']}")
-        blocks.append(sec)
-    if view.deferred:
-        blocks.append(
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": "次回へ: " + "、".join(esc(d.title) for d in view.deferred)}]}
+        body.append(sec)
+    if len(rows) < len(view.rows):
+        rest = view.rows[len(rows) :]
+        text = join_within(
+            [f"{esc(r['title'])}（{r['minutes']} 分）" for r in rest],
+            f"ほか {len(rest)} 件（1 つのメッセージに出せる数を超えたため省略）: ",
         )
-    if not view.rows:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "まだ議題がありません。"}})
-    if can_manage is not None:
-        blocks += settle_blocks(view, can_manage)
-    return blocks
+        body.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text}]})
+    return head + body + tail
 
 
 def errors(e) -> dict[str, Any]:

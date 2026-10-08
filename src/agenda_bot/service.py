@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 
 from . import clock
-from .model import CanvasRecord, DraftItem, FixedItem, Meeting, agenda_markdown, build_agenda, new_id
+from .model import CanvasRecord, DraftItem, FixedItem, Meeting, accepted_expiry, agenda_markdown, build_agenda, new_id
 from .repository import Repository
 
 
@@ -116,7 +116,7 @@ def remove_draft(repo: Repository, meeting: Meeting, meeting_date: str, item_id:
     """
     d = next((x for x in repo.drafts(meeting.meeting_id, meeting_date) if x.item_id == item_id), None)
     if d is None:
-        d = next((x for x in repo.drafts_before(meeting.meeting_id, meeting_date) if x.item_id == item_id), None)
+        d = next((x for x in repo.drafts_before(meeting.meeting_id, meeting_date, meeting.settled_through) if x.item_id == item_id), None)
     if d is None:
         raise ValidationError("item", "その議題は見つかりません（取り下げ済みかもしれません）")
     if user not in (d.created_by, meeting.owner):
@@ -144,7 +144,7 @@ def _project(repo: Repository, meeting: Meeting, day: date) -> tuple[list[DraftI
     実際に状態を変えるのは、担当者の「確定」（finalize）と「中止」（cancel）だけ。
     """
     by_date: dict[str, list[DraftItem]] = {}
-    for d in repo.drafts_before(meeting.meeting_id, day.isoformat()):
+    for d in repo.drafts_before(meeting.meeting_id, day.isoformat(), meeting.settled_through):
         by_date.setdefault(d.meeting_date, []).append(d)
     if not by_date:
         return [], []
@@ -169,7 +169,7 @@ def _settle_target(repo: Repository, meeting: Meeting, meeting_date: str, now: d
         raise ValidationError("meeting_date", f"開催日の形が違います: {meeting_date}") from None
     if target >= day:
         raise ValidationError("meeting_date", f"{meeting_date} の会議はまだ終わっていません（確定・中止は会議の後にできます）")
-    pending = repo.drafts_before(meeting.meeting_id, day.isoformat())
+    pending = repo.drafts_before(meeting.meeting_id, day.isoformat(), meeting.settled_through)
     older = sorted({d.meeting_date for d in pending if d.meeting_date < meeting_date})
     if older:
         raise ValidationError("meeting_date", f"先に {older[0]} の会議を確定か中止にしてください（古い順に決めます）")
@@ -204,16 +204,20 @@ def finalize(repo: Repository, meeting: Meeting, meeting_date: str, now: date | 
     accepted = []
     for d in items:
         if d.item_id in done_ids:
-            a = replace(d, status="accepted")
+            a = replace(d, status="accepted", expires_at=accepted_expiry(d.meeting_date))  # 一定期間の後に TTL で消える
             repo.put_draft(a)
             accepted.append(a)
-    return accepted, _move_to_next(repo, meeting, deferred, target)
+    moved = _move_to_next(repo, meeting, deferred, target)
+    repo.mark_settled(meeting.meeting_id, meeting_date)  # これ以前の議題は、次から読まない
+    return accepted, moved
 
 
 def cancel(repo: Repository, meeting: Meeting, meeting_date: str, now: date | datetime) -> list[DraftItem]:
     """「中止」: 開催日 meeting_date の会議は開かれなかったとし、残っている議題をすべて次の開催日へ繰り越す. → 繰り越した議題."""
     items, target = _settle_target(repo, meeting, meeting_date, now)
-    return _move_to_next(repo, meeting, items, target)
+    moved = _move_to_next(repo, meeting, items, target)
+    repo.mark_settled(meeting.meeting_id, meeting_date)
+    return moved
 
 
 def agenda(repo: Repository, meeting: Meeting, today: date | datetime) -> AgendaView:
@@ -290,6 +294,33 @@ def _save_created(repo: Repository, client: CanvasApi, rec: CanvasRecord, mode: 
     ) from last
 
 
+def _slack_error(e: Exception) -> str:
+    """slack_sdk の SlackApiError の error コード（canvas_not_found など）. 取れなければ空."""
+    res = getattr(e, "response", None)
+    try:
+        return str(res["error"]) if res is not None else ""
+    except (KeyError, TypeError):
+        return ""
+
+
+def _create_canvas(repo: Repository, client: CanvasApi, meeting: Meeting, view: AgendaView, key_date: str, mode: str) -> str:
+    """「作成中」の印を書けた人だけが呼ぶ. Canvas を作り、ID を保存してから権限を付ける. → Canvas の ID."""
+    content = {"type": "markdown", "markdown": view.markdown}
+    try:
+        if mode == "channel":
+            res = client.conversations_canvases_create(channel_id=meeting.channel_id, document_content=content)
+        else:
+            res = client.canvases_create(title=f"{meeting.name} {view.meeting_date.isoformat()}", document_content=content)
+    except Exception:
+        repo.delete_canvas(meeting.meeting_id, key_date)  # 作れなかったので印を消し、もう一度押せるようにする
+        raise
+    canvas_id = res["canvas_id"]
+    _save_created(repo, client, CanvasRecord(meeting.meeting_id, key_date, canvas_id), mode)  # 権限の付与より先に保存する
+    if mode != "channel":
+        client.canvases_access_set(canvas_id=canvas_id, access_level="write", channel_ids=[meeting.channel_id])
+    return canvas_id
+
+
 def publish_canvas(
     repo: Repository, client: CanvasApi, meeting: Meeting, today: date | datetime, mode: str = "standalone"
 ) -> tuple[str, bool]:
@@ -300,6 +331,7 @@ def publish_canvas(
 
     重複を防ぐため、作る前に「作成中」の印を条件付きで書き（先に書けた 1 人だけが作る）、作った直後に ID を保存してから権限を付ける。
     権限の付与に失敗しても ID は残るので、もう一度押すと同じ Canvas を更新し、権限を付け直す。
+    記録した Canvas が Slack 側で消されていた（canvas_not_found）ときは、記録を「作成中」の印に置き換えてから作り直す。
     """
     view = agenda(repo, meeting, today)
     key_date = view.meeting_date.isoformat() if mode == "standalone" else "channel"
@@ -309,26 +341,22 @@ def publish_canvas(
         if rec is not None and not _stale(rec):
             raise Busy("canvas", "Canvas を作成中です。少し待ってから、もう一度押してください")
         claim = CanvasRecord(meeting.meeting_id, key_date, PENDING)
-        if not repo.put_canvas_if(claim, rec):
-            rec = repo.get_canvas(meeting.meeting_id, key_date)
-            if rec is None or rec.canvas_id == PENDING:
-                raise Busy("canvas", "Canvas を作成中です。少し待ってから、もう一度押してください")
-        else:
-            try:
-                if mode == "channel":
-                    res = client.conversations_canvases_create(channel_id=meeting.channel_id, document_content=content)
-                else:
-                    res = client.canvases_create(title=f"{meeting.name} {view.meeting_date.isoformat()}", document_content=content)
-            except Exception:
-                repo.delete_canvas(meeting.meeting_id, key_date)  # 作れなかったので印を消し、もう一度押せるようにする
-                raise
-            canvas_id = res["canvas_id"]
-            _save_created(repo, client, CanvasRecord(meeting.meeting_id, key_date, canvas_id), mode)  # 権限の付与より先に保存する
-            if mode != "channel":
-                client.canvases_access_set(canvas_id=canvas_id, access_level="write", channel_ids=[meeting.channel_id])
-            return canvas_id, True
-    client.canvases_edit(canvas_id=rec.canvas_id, changes=[{"operation": "replace", "document_content": content}])
-    if mode != "channel":  # 前回の権限の付与が失敗していても、ここで付け直す（同じ設定なので何度実行してもよい）
-        client.canvases_access_set(canvas_id=rec.canvas_id, access_level="write", channel_ids=[meeting.channel_id])
+        if repo.put_canvas_if(claim, rec):
+            return _create_canvas(repo, client, meeting, view, key_date, mode), True
+        rec = repo.get_canvas(meeting.meeting_id, key_date)
+        if rec is None or rec.canvas_id == PENDING:
+            raise Busy("canvas", "Canvas を作成中です。少し待ってから、もう一度押してください")
+    try:
+        client.canvases_edit(canvas_id=rec.canvas_id, changes=[{"operation": "replace", "document_content": content}])
+        if mode != "channel":  # 前回の権限の付与が失敗していても、ここで付け直す（同じ設定なので何度実行してもよい）
+            client.canvases_access_set(canvas_id=rec.canvas_id, access_level="write", channel_ids=[meeting.channel_id])
+    except Exception as e:
+        if _slack_error(e) != "canvas_not_found":
+            raise
+        log.warning("記録した Canvas %s が見つかりません（Slack で削除された）. 記録を消して作り直します", rec.canvas_id)
+        # 記録が読んだときのままなら「作成中」の印に置き換える（同時に押した人のうち 1 人だけが作り直す）
+        if not repo.put_canvas_if(CanvasRecord(meeting.meeting_id, key_date, PENDING), rec):
+            raise Busy("canvas", "Canvas を作り直しています。少し待ってから、もう一度押してください") from e
+        return _create_canvas(repo, client, meeting, view, key_date, mode), True
     repo.put_canvas(CanvasRecord(meeting.meeting_id, key_date, rec.canvas_id))
     return rec.canvas_id, False

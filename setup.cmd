@@ -4,7 +4,10 @@ cd /d "%~dp0"
 where py >nul 2>nul && (set PY=py -3) || (set PY=python)
 %PY% -m venv .venv || goto :err
 .venv\Scripts\python -m pip install -q --upgrade pip
-.venv\Scripts\python -m pip install -q -e ".[dev]" || goto :err
+rem constraints.txt（GitHub Actions の deps-lock が作る）があれば、依存の版を CI と同じにする
+set C=
+if exist constraints.txt set C=-c constraints.txt
+.venv\Scripts\python -m pip install -q %C% -e ".[dev]" || goto :err
 if not exist .env copy .env.example .env >nul
 docker compose -f local\docker-compose.yml up -d || goto :err
 timeout /t 3 >nul

@@ -21,6 +21,8 @@ jobs:
       # constraints.txt（deps-lock.yml が作る）があれば、版を固定して入れる
       - run: if [ -f constraints.txt ]; then pip install -e ".[dev]" -c constraints.txt; else pip install -e ".[dev]"; fi
       - run: ruff check . && ruff format --check .
+      - name: type check (mypy)
+        run: mypy
       - run: pytest -q -rs   # moto（DynamoDB の模擬）と slack_bolt のテストも実行される
 
   test-windows:
@@ -99,5 +101,10 @@ jobs:
           service.add_draft(repo, m, date(2026, 10, 2), "長い議題", "", 30, "", "UB")
           v = service.agenda(repo, m, date(2026, 10, 6))
           assert [(r["kind"], r["title"]) for r in v.rows] == [("繰越", "長い議題")], v.rows
+          # 見るだけでは状態を変えず、担当者の「確定」で書き換える
+          assert {d.status for d in repo.drafts(m.meeting_id, "2026-10-05")} == {"proposed"}
+          service.finalize(repo, m, "2026-10-05", date(2026, 10, 6))
+          assert [(d.title, d.status) for d in repo.drafts(m.meeting_id, "2026-10-05")] == [("議題", "accepted")]
+          assert [(d.title, d.status) for d in repo.drafts(m.meeting_id, "2026-10-12")] == [("長い議題", "deferred")]
           print(v.markdown)
           PY

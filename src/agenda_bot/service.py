@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import logging
+import time
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 
@@ -23,6 +25,9 @@ MAX_TITLE = 100  # 議題・会議名の長さの上限（文字）
 MAX_DETAIL = 2000  # 補足の長さの上限（文字）
 PENDING = ""  # Canvas を作っている途中（canvases に ID の代わりに入れる）
 PENDING_TIMEOUT = timedelta(minutes=5)  # 作成中の印がこれより古ければ、作成が途中で止まったとみなして作り直す
+SAVE_BACKOFF = 0.5  # Canvas の ID の保存をやり直すまでの秒（回数に比例して延ばす）
+
+log = logging.getLogger("agenda_bot")
 
 
 class Busy(ValidationError):
@@ -105,13 +110,18 @@ def add_draft(
 
 
 def remove_draft(repo: Repository, meeting: Meeting, meeting_date: str, item_id: str, user: str) -> None:
-    """取り下げられるのは、出した本人か会議の担当者だけ."""
+    """取り下げられるのは、出した本人か会議の担当者だけ.
+
+    アジェンダに「繰越」として見えている議題は、確定するまで元の開催日に保存されているので、そちらも探す。
+    """
     d = next((x for x in repo.drafts(meeting.meeting_id, meeting_date) if x.item_id == item_id), None)
+    if d is None:
+        d = next((x for x in repo.drafts_before(meeting.meeting_id, meeting_date) if x.item_id == item_id), None)
     if d is None:
         raise ValidationError("item", "その議題は見つかりません（取り下げ済みかもしれません）")
     if user not in (d.created_by, meeting.owner):
         raise ValidationError("item", "議題を取り下げられるのは、出した人と会議の担当者だけです")
-    repo.delete_draft(meeting.meeting_id, meeting_date, item_id)
+    repo.delete_draft(meeting.meeting_id, d.meeting_date, item_id)
 
 
 @dataclass
@@ -122,48 +132,102 @@ class AgendaView:
     total: int
     deferred: list[DraftItem]
     markdown: str
+    # 確定も中止もされていない過去の開催日（古い順）. 担当者が「確定」か「中止」を選ぶまで、保存した状態は変えない
+    unsettled: list[str] = field(default_factory=list)
 
 
-def carry_over(repo: Repository, meeting: Meeting, day: date) -> list[DraftItem]:
-    """開催日 day より前の開催日に残っている議題を片付ける. → day に繰り越した議題.
+def _project(repo: Repository, meeting: Meeting, day: date) -> tuple[list[DraftItem], list[str]]:
+    """開催日 day のアジェンダに繰り越して見せる議題と、確定も中止もされていない過去の開催日. 保存した状態は変えない（読み取りだけ）.
 
-    過去の開催日ごとに（古い順）、その日のアジェンダを今の固定の議題で組み直し、
-    - 会議時間に収まった議題は accepted（扱い済み）にしてその日に残す
-    - 収まらなかった議題は status=deferred にして次の開催日に移す（移した先のアジェンダでは先頭側に並ぶ）
-    移す先に書いてから元を消すので、途中で止まっても、もう一度実行すれば同じ結果になる。
+    過去の開催日に残っている議題（accepted 以外）を古い順に、その日のアジェンダを今の固定の議題で組み直して、
+    会議時間に収まった議題は「扱われた」とみなして見せず、収まらなかった議題を次の開催日へ繰り越したものとして見せる。
+    実際に状態を変えるのは、担当者の「確定」（finalize）と「中止」（cancel）だけ。
     """
     by_date: dict[str, list[DraftItem]] = {}
     for d in repo.drafts_before(meeting.meeting_id, day.isoformat()):
         by_date.setdefault(d.meeting_date, []).append(d)
     if not by_date:
-        return []
+        return [], []
     fixed = repo.fixed_items(meeting.meeting_id)
     dates = sorted(by_date)
     carried: list[DraftItem] = []
-    for i, past in enumerate(dates):
-        rows, _, deferred = build_agenda(meeting, date.fromisoformat(past), fixed, by_date[past] + carried)
-        done = {r["item_id"] for r in rows if "item_id" in r}
-        for d in by_date[past] + carried:
-            if d.item_id in done:
-                repo.put_draft(replace(d, status="accepted"))
-        target = dates[i + 1] if i + 1 < len(dates) else day.isoformat()
-        carried = []
-        for d in deferred:
-            new = replace(d, meeting_date=target, status="deferred", carried_from=d.carried_from or d.meeting_date)
-            repo.put_draft(new)
-            repo.delete_draft(meeting.meeting_id, d.meeting_date, d.item_id)
-            carried.append(new)
-    return carried
+    for past in dates:
+        _, _, deferred = build_agenda(meeting, date.fromisoformat(past), fixed, by_date[past] + carried)
+        carried = [replace(d, status="deferred", carried_from=d.carried_from or d.meeting_date) for d in deferred]
+    return carried, dates
+
+
+def _settle_target(repo: Repository, meeting: Meeting, meeting_date: str, now: date | datetime) -> tuple[list[DraftItem], date]:
+    """確定・中止できる開催日か確かめる. → (その日に残っている議題, 繰り越す先の開催日).
+
+    繰り越す先は、議題の残っている次の過去の開催日か、無ければ次の開催日（議題の無い週は飛ばす. 以前の繰り越しと同じ）。
+    """
+    day = meeting.next_date(now)
+    try:
+        target = date.fromisoformat(meeting_date)
+    except ValueError:
+        raise ValidationError("meeting_date", f"開催日の形が違います: {meeting_date}") from None
+    if target >= day:
+        raise ValidationError("meeting_date", f"{meeting_date} の会議はまだ終わっていません（確定・中止は会議の後にできます）")
+    pending = repo.drafts_before(meeting.meeting_id, day.isoformat())
+    older = sorted({d.meeting_date for d in pending if d.meeting_date < meeting_date})
+    if older:
+        raise ValidationError("meeting_date", f"先に {older[0]} の会議を確定か中止にしてください（古い順に決めます）")
+    items = [d for d in pending if d.meeting_date == meeting_date]
+    if not items:
+        raise ValidationError("meeting_date", f"{meeting_date} の会議は確定か中止が済んでいます")
+    later = sorted({d.meeting_date for d in pending if d.meeting_date > meeting_date})
+    return items, (date.fromisoformat(later[0]) if later else day)
+
+
+def _move_to_next(repo: Repository, meeting: Meeting, items: list[DraftItem], next_day: date) -> list[DraftItem]:
+    """議題を次の開催日へ繰り越す. 移す先に書いてから元を消すので、途中で止まっても、もう一度実行すれば同じ結果になる."""
+    moved = []
+    for d in items:
+        new = replace(d, meeting_date=next_day.isoformat(), status="deferred", carried_from=d.carried_from or d.meeting_date)
+        repo.put_draft(new)
+        repo.delete_draft(meeting.meeting_id, d.meeting_date, d.item_id)
+        moved.append(new)
+    return moved
+
+
+def finalize(repo: Repository, meeting: Meeting, meeting_date: str, now: date | datetime) -> tuple[list[DraftItem], list[DraftItem]]:
+    """「確定」: 開催日 meeting_date の会議を、アジェンダのとおりに行ったとする. → (扱い済みにした議題, 次の開催日へ繰り越した議題).
+
+    会議時間に収まった議題は accepted（扱い済み）にしてその日に残し、収まらなかった議題は次の開催日へ繰り越す。
+    確定も中止もしていない古い開催日があれば、先にそちらを決めるよう ValidationError にする。
+    """
+    items, target = _settle_target(repo, meeting, meeting_date, now)
+    day = date.fromisoformat(meeting_date)
+    rows, _, deferred = build_agenda(meeting, day, repo.fixed_items(meeting.meeting_id), items)
+    done_ids = {r["item_id"] for r in rows if "item_id" in r}
+    accepted = []
+    for d in items:
+        if d.item_id in done_ids:
+            a = replace(d, status="accepted")
+            repo.put_draft(a)
+            accepted.append(a)
+    return accepted, _move_to_next(repo, meeting, deferred, target)
+
+
+def cancel(repo: Repository, meeting: Meeting, meeting_date: str, now: date | datetime) -> list[DraftItem]:
+    """「中止」: 開催日 meeting_date の会議は開かれなかったとし、残っている議題をすべて次の開催日へ繰り越す. → 繰り越した議題."""
+    items, target = _settle_target(repo, meeting, meeting_date, now)
+    return _move_to_next(repo, meeting, items, target)
 
 
 def agenda(repo: Repository, meeting: Meeting, today: date | datetime) -> AgendaView:
-    """次の開催日のアジェンダ. 先に過去の開催日の未消化の議題を繰り越す（carry_over）."""
+    """次の開催日のアジェンダ（読み取りだけで、保存した状態は変えない）.
+
+    確定も中止もされていない過去の開催日があれば、収まらなかった議題を繰り越したものとして並べ（_project）、
+    その開催日を unsettled に入れる（画面で担当者に「確定」「中止」を選んでもらう）。
+    """
     day = meeting.next_date(today)
-    carry_over(repo, meeting, day)
+    carried, unsettled = _project(repo, meeting, day)
     rows, total, deferred = build_agenda(
-        meeting, day, repo.fixed_items(meeting.meeting_id), repo.drafts(meeting.meeting_id, day.isoformat())
+        meeting, day, repo.fixed_items(meeting.meeting_id), repo.drafts(meeting.meeting_id, day.isoformat()) + carried
     )
-    return AgendaView(meeting, day, rows, total, deferred, agenda_markdown(meeting, day, rows, total, deferred))
+    return AgendaView(meeting, day, rows, total, deferred, agenda_markdown(meeting, day, rows, total, deferred), unsettled)
 
 
 class CanvasApi(Protocol):
@@ -172,6 +236,7 @@ class CanvasApi(Protocol):
     def canvases_create(self, **kw: Any) -> Any: ...
     def canvases_edit(self, **kw: Any) -> Any: ...
     def canvases_access_set(self, **kw: Any) -> Any: ...
+    def canvases_delete(self, **kw: Any) -> Any: ...
     def conversations_canvases_create(self, **kw: Any) -> Any: ...
 
 
@@ -181,6 +246,48 @@ def _stale(rec: CanvasRecord) -> bool:
     except ValueError:
         return True
     return clock.now() - at > PENDING_TIMEOUT
+
+
+SAVE_ATTEMPTS = 3  # 作った Canvas の ID を保存する回数（一時的な保存先のエラーに備える）
+
+
+class CanvasSaveError(RuntimeError):
+    """作った Canvas の ID を保存できなかった. 重複を避けるため、作った Canvas は消してある（消せなかったときは ID を知らせる）."""
+
+
+def _save_created(repo: Repository, client: CanvasApi, rec: CanvasRecord, mode: str) -> None:
+    """作った直後の Canvas の ID を保存する. 保存できないまま「作成中」の印が古くなると、次に押したときにもう 1 つ作ってしまうので:
+
+    1. 何度か保存し直す
+    2. それでも保存できなければ、作った Canvas を消してから印を消す（次に押せば 1 つだけ作り直す）
+    3. 消せなければ印を残したまま、Canvas の ID を例外のメッセージに入れて知らせる（手で消すか記録してもらう）
+    """
+    last: Exception | None = None
+    for attempt in range(SAVE_ATTEMPTS):
+        try:
+            repo.put_canvas(rec)
+            return
+        except Exception as e:  # noqa: BLE001 — 保存先（DynamoDB など）の一時的な失敗
+            last = e
+            log.warning("Canvas の ID の保存に失敗しました（%d/%d 回目）", attempt + 1, SAVE_ATTEMPTS, exc_info=True)
+            time.sleep(SAVE_BACKOFF * (attempt + 1))
+    try:
+        if mode == "channel":
+            raise RuntimeError("チャンネルの Canvas は API で消せません")
+        client.canvases_delete(canvas_id=rec.canvas_id)
+    except Exception as e:  # noqa: BLE001
+        log.error("Canvas %s の ID を保存できず、消すこともできませんでした", rec.canvas_id, exc_info=True)
+        raise CanvasSaveError(
+            f"Canvas（ID: {rec.canvas_id}）は作りましたが、ID を保存できませんでした（{last}）。"
+            f"重複して作らないよう、この Canvas を手で消してから、もう一度押してください（消せなかった理由: {e}）"
+        ) from last
+    try:
+        repo.delete_canvas(rec.meeting_id, rec.meeting_date)
+    except Exception:  # noqa: BLE001 — 印は 5 分で古いとみなされ、作り直せる
+        log.warning("作成中の印を消せませんでした", exc_info=True)
+    raise CanvasSaveError(
+        f"Canvas の ID を保存できなかったため、作った Canvas を消しました（{last}）。少し待ってから、もう一度押してください"
+    ) from last
 
 
 def publish_canvas(
@@ -216,7 +323,7 @@ def publish_canvas(
                 repo.delete_canvas(meeting.meeting_id, key_date)  # 作れなかったので印を消し、もう一度押せるようにする
                 raise
             canvas_id = res["canvas_id"]
-            repo.put_canvas(CanvasRecord(meeting.meeting_id, key_date, canvas_id))  # 権限の付与より先に保存する
+            _save_created(repo, client, CanvasRecord(meeting.meeting_id, key_date, canvas_id), mode)  # 権限の付与より先に保存する
             if mode != "channel":
                 client.canvases_access_set(canvas_id=canvas_id, access_level="write", channel_ids=[meeting.channel_id])
             return canvas_id, True

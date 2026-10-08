@@ -101,6 +101,17 @@ def parse_admins(value: str | None) -> frozenset[str]:
     return frozenset(ids)
 
 
+_CHANNEL_ID = re.compile(r"^[CG][A-Z0-9]{2,}$")
+
+
+def parse_channel(value: str | None) -> str:
+    """ERROR_CHANNEL（失敗を知らせる管理チャンネルの ID. 空なら知らせない）. ID の形でなければ ConfigError."""
+    value = (value or "").strip()
+    if value and not _CHANNEL_ID.match(value):
+        raise ConfigError(f"ERROR_CHANNEL「{value}」はチャンネル ID（C… / G…）ではありません（チャンネル名ではなく ID を書く）")
+    return value
+
+
 def today_in(tz: str | None = None) -> Callable[[], date]:
     """設定したタイムゾーン（tz → 環境変数 TIMEZONE → Asia/Tokyo）の「今日」を返す関数."""
     return lambda: clock.today(tz)
@@ -112,7 +123,7 @@ def now_in(tz: str | None = None) -> Callable[[], datetime]:
 
 
 NOT_FOUND = "その会議は見つかりません（削除されたか、別のワークスペースのものかもしれません）。`/agenda` からやり直してください。"
-NOT_ALLOWED = "この操作（会議の登録・固定の議題・Canvas への出力）ができるのは、設定された担当者だけです。"
+NOT_ALLOWED = "この操作（会議の登録・固定の議題・Canvas への出力・会議の確定と中止）ができるのは、設定された担当者だけです。"
 
 
 class Handlers:
@@ -137,7 +148,7 @@ class Handlers:
     # --- 共通 ---
 
     def can_manage(self, user: str) -> bool:
-        """会議の登録・固定の議題・Canvas への出力ができるか. AGENDA_ADMINS が空なら誰でもできる."""
+        """会議の登録・固定の議題・Canvas への出力・過去の会議の確定と中止ができるか. AGENDA_ADMINS が空なら誰でもできる."""
         return not self.admins or user in self.admins
 
     @staticmethod
@@ -212,7 +223,7 @@ class Handlers:
             text=f"<@{d.created_by}> さんが {d.meeting_date} の議題を出しました: *{views.esc(d.title)}*（{d.minutes} 分）",
         )
 
-    def show(self, ack, action, respond):
+    def show(self, ack, action, body, respond):
         ack()
         m = self.repo.get_meeting(action["value"])
         if m is None:
@@ -221,7 +232,7 @@ class Handlers:
         respond(
             response_type="ephemeral",
             replace_original=False,
-            blocks=views.agenda_blocks(service.agenda(self.repo, m, self.now()), ""),
+            blocks=views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", self.can_manage(body["user"]["id"])),
             text="アジェンダ",
         )
 
@@ -240,9 +251,46 @@ class Handlers:
         respond(
             response_type="ephemeral",
             replace_original=True,
-            blocks=views.agenda_blocks(service.agenda(self.repo, m, self.now()), ""),
+            blocks=views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", self.can_manage(body["user"]["id"])),
             text="取り下げました",
         )
+
+    # --- 過去の会議の確定・中止（担当者だけ） ---
+
+    def _settle(self, ack, action, body, respond, client, op: str) -> None:
+        ack()
+        if not self.can_manage(body["user"]["id"]):
+            self._say(respond, NOT_ALLOWED)
+            return
+        meeting_id, _, meeting_date = action["value"].partition("|")
+        m = self.repo.get_meeting(meeting_id)
+        if m is None:
+            self._say(respond, NOT_FOUND)
+            return
+        try:
+            if op == "finalize":
+                accepted, moved = service.finalize(self.repo, m, meeting_date, self.now())
+                note = f"{meeting_date} の会議を確定しました（扱い済み {len(accepted)} 件・次回へ繰り越し {len(moved)} 件）。"
+            else:
+                moved = service.cancel(self.repo, m, meeting_date, self.now())
+                note = f"{meeting_date} の会議を中止にしました（議題 {len(moved)} 件を次回へ繰り越し）。"
+        except service.ValidationError as e:
+            self._say(respond, str(e))
+            return
+        respond(
+            response_type="ephemeral",
+            replace_original=True,
+            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}]
+            + views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", True),
+            text=note,
+        )
+        client.chat_postMessage(channel=m.channel_id, text=f"<@{body['user']['id']}> さん: {views.esc(m.name)} の {note}")
+
+    def finalize(self, ack, action, body, respond, client):
+        self._settle(ack, action, body, respond, client, "finalize")
+
+    def cancel(self, ack, action, body, respond, client):
+        self._settle(ack, action, body, respond, client, "cancel")
 
     # --- 固定の議題 ---
 
@@ -326,6 +374,53 @@ class Handlers:
         client.chat_postMessage(channel=m.channel_id, text=f"{views.esc(m.name)} のアジェンダを Canvas に{word}（ID: {canvas_id}）。")
 
 
+ERROR_TEXT = "処理中にエラーが起きました。少し待ってから、もう一度試してください（続くときはボットの管理者に連絡してください）。"
+
+
+class ErrorReporter:
+    """Bolt の app.error に登録する、ハンドラーの想定外の例外の受け口.
+
+    - ログに例外を残す（スタックトレース付き）
+    - 押した本人には、本人にだけ見えるメッセージで失敗を知らせる（respond が使えるとき）
+    - 管理チャンネル（ERROR_CHANNEL）が設定されていれば、そこにも短く知らせる（例外の種類と操作の名前だけ。入力の中身は送らない）
+    知らせる処理そのものが失敗しても、ログに残して握りつぶす（エラーの処理でさらに落ちないように）。
+    """
+
+    def __init__(self, error_channel: str = ""):
+        self.error_channel = error_channel
+
+    @staticmethod
+    def _what(body: dict | None) -> str:
+        body = body or {}
+        if body.get("command"):
+            return str(body["command"])
+        actions = body.get("actions") or []
+        if actions:
+            return f"action:{actions[0].get('action_id', '?')}"
+        if body.get("view"):
+            return f"view:{body['view'].get('callback_id', '?')}"
+        return str(body.get("type", "?"))
+
+    def __call__(self, error: Exception, body: dict | None = None, respond=None, client=None, logger=None) -> None:
+        what = self._what(body)
+        user = ((body or {}).get("user") or {}).get("id") or (body or {}).get("user_id", "")
+        (logger or log).error("ハンドラーで想定外のエラー（%s）: %s", what, type(error).__name__, exc_info=error)
+        if respond is not None:
+            try:
+                respond(response_type="ephemeral", replace_original=False, text=ERROR_TEXT)
+            except Exception:  # noqa: BLE001
+                log.warning("エラーを本人に知らせられませんでした", exc_info=True)
+        if self.error_channel and client is not None:
+            try:
+                who = f"<@{user}> さんの" if user else ""
+                client.chat_postMessage(
+                    channel=self.error_channel,
+                    text=f":warning: アジェンダ係: {who}操作 `{views.esc(what)}` が失敗しました（{type(error).__name__}）。ログを確認してください。",
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("管理チャンネル %s にエラーを知らせられませんでした", self.error_channel, exc_info=True)
+
+
 def build_app(
     repo: Repository,
     *,
@@ -334,13 +429,18 @@ def build_app(
     admins: Iterable[str] = (),
     today: Callable[[], date | datetime] | None = None,
     tz: str | None = None,
+    error_channel: str = "",
     **app_kwargs,
 ):
-    """Bolt の App を作り、Handlers を登録する. today は「今」を返す関数（テストで時刻を止める. 日付だけでもよい）."""
+    """Bolt の App を作り、Handlers とエラーの受け口（ErrorReporter）を登録する.
+
+    today は「今」を返す関数（テストで時刻を止める. 日付だけでもよい）。error_channel は失敗を知らせる管理チャンネルの ID（空なら知らせない）。
+    """
     from slack_bolt import App
 
     h = Handlers(repo, canvas_mode=canvas_mode, admins=admins, now=today, tz=tz)
     app = App(token=token, **app_kwargs)
+    app.error(ErrorReporter(error_channel))
     app.command("/agenda")(h.agenda_command)
     app.action(views.A_REGISTER)(h.register)
     app.view(views.V_REGISTER)(h.register_submit)
@@ -352,7 +452,27 @@ def build_app(
     app.view(views.V_FIXED)(h.fixed_submit)
     app.action(views.A_DELETE_FIXED)(h.delete_fixed)
     app.action(views.A_CANVAS)(h.canvas)
+    app.action(views.A_FINALIZE)(h.finalize)
+    app.action(views.A_CANCEL)(h.cancel)
     return app
+
+
+LOCAL_DUMMY_CREDENTIAL = "local"  # DynamoDB Local は認証情報を検証しないが、boto3 は値を必要とする
+
+
+def use_local_dynamodb() -> bool:
+    """DYNAMODB_ENDPOINT（DynamoDB Local）があり、AWS の認証情報が無ければ、ダミーの値を使う. → ダミーを入れたか.
+
+    .env に AWS のアクセスキーを書かずに済むようにする（実際のキーを .env に置かない）。AWS では DYNAMODB_ENDPOINT を空にし、
+    IAM ロールかプロファイルを使う。
+    """
+    if not os.environ.get("DYNAMODB_ENDPOINT"):
+        return False
+    if os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_PROFILE"):
+        return False
+    os.environ["AWS_ACCESS_KEY_ID"] = LOCAL_DUMMY_CREDENTIAL
+    os.environ["AWS_SECRET_ACCESS_KEY"] = LOCAL_DUMMY_CREDENTIAL
+    return True
 
 
 def main() -> None:
@@ -364,15 +484,23 @@ def main() -> None:
         app_token = require_env("SLACK_APP_TOKEN")
         mode = canvas_mode_from_env()
         admins = parse_admins(os.environ.get("AGENDA_ADMINS"))
+        error_channel = parse_channel(os.environ.get("ERROR_CHANNEL"))
     except (ConfigError, ValueError) as e:
         sys.exit(f"設定の誤り: {e}")
-    log.info("timezone: %s / canvas mode: %s / admins: %s", tz.key, mode, len(admins) or "全員")
+    log.info(
+        "timezone: %s / canvas mode: %s / admins: %s / error channel: %s",
+        tz.key,
+        mode,
+        len(admins) or "全員",
+        "あり" if error_channel else "なし",
+    )
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+    use_local_dynamodb()
     repo = DynamoRepository(
         prefix=os.environ.get("TABLE_PREFIX", "agenda_"),
         endpoint_url=os.environ.get("DYNAMODB_ENDPOINT") or None,
         region=os.environ.get("AWS_REGION", "ap-northeast-1"),
     )
-    app = build_app(repo, token=bot_token, canvas_mode=mode, admins=admins, tz=tz.key)
+    app = build_app(repo, token=bot_token, canvas_mode=mode, admins=admins, tz=tz.key, error_channel=error_channel)
     SocketModeHandler(app, app_token).start()

@@ -14,6 +14,8 @@ A_CANVAS = "agenda_canvas"
 A_REGISTER = "agenda_register"
 A_REMOVE_DRAFT = "agenda_remove_draft"
 A_DELETE_FIXED = "agenda_delete_fixed"
+A_FINALIZE = "agenda_finalize"
+A_CANCEL = "agenda_cancel"
 V_REGISTER = "agenda_view_register"
 V_DRAFT = "agenda_view_draft"
 V_FIXED = "agenda_view_fixed"
@@ -149,7 +151,39 @@ def fixed_modal(meeting: Meeting, items: list, can_manage: bool = True) -> dict[
     return modal
 
 
-def agenda_blocks(view: AgendaView, user: str) -> list[dict[str, Any]]:
+def settle_blocks(view: AgendaView, can_manage: bool) -> list[dict[str, Any]]:
+    """確定も中止もされていない過去の開催日（いちばん古い日）について、担当者に「確定」「中止」を選んでもらう.
+
+    確定: アジェンダのとおりに行った（収まった議題は扱い済み、収まらなかった議題は次の開催日へ）
+    中止: 会議は開かれなかった（議題をすべて次の開催日へ）
+    """
+    if not view.unsettled:
+        return []
+    day = view.unsettled[0]
+    more = f"（ほかに {len(view.unsettled) - 1} 回分）" if len(view.unsettled) > 1 else ""
+    text = f"*{day} の会議* の結果がまだ決まっていません{more}。下のアジェンダは、収まった議題を扱ったものとして見込みで並べています。"
+    blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+    value = f"{view.meeting.meeting_id}|{day}"
+    if can_manage:
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    _btn("確定（アジェンダのとおり行った）", A_FINALIZE, value, "primary"),
+                    _btn("中止（議題をすべて次回へ）", A_CANCEL, value),
+                ],
+            }
+        )
+    else:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "確定・中止は、設定された担当者が選びます。"}]})
+    return blocks
+
+
+def agenda_blocks(view: AgendaView, user: str, can_manage: bool | None = None) -> list[dict[str, Any]]:
+    """アジェンダの表示.
+
+    can_manage が None（チャンネルへの投稿など）なら確定・中止の案内を出さない。True ならボタンも、False なら案内だけ出す。
+    """
     m = view.meeting
     blocks: list[dict[str, Any]] = [
         {
@@ -174,6 +208,8 @@ def agenda_blocks(view: AgendaView, user: str) -> list[dict[str, Any]]:
         )
     if not view.rows:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "まだ議題がありません。"}})
+    if can_manage is not None:
+        blocks += settle_blocks(view, can_manage)
     return blocks
 
 

@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 dependencies = ["slack_bolt>=1.18", "boto3>=1.34", "tzdata; sys_platform == 'win32'"]  # Windows はタイムゾーンのデータを持たないため tzdata
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "moto[dynamodb]>=5.0"]
+dev = ["pytest>=8", "ruff>=0.6", "moto[dynamodb]>=5.0", "mypy>=1.11"]
 
 [project.scripts]
 agenda-bot = "agenda_bot.app:main"
@@ -29,6 +29,16 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM"]
 
 [tool.ruff.lint.pycodestyle]
 max-line-length = 190
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# boto3 / botocore は型情報（py.typed）を持たない
+module = ["boto3", "boto3.*", "botocore", "botocore.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

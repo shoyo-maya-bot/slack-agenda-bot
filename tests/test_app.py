@@ -163,7 +163,7 @@ def test_unknown_meeting_is_acked_and_reported(repo):
         method(ack=ack, body=body(), client=client, action={"value": "nope"}, respond=respond)
         assert len(ack.calls) == 1 and "見つかりません" in respond.last["text"] and client.calls == []
     ack, respond = Recorder(), Recorder()
-    h.show(ack=ack, action={"value": "nope"}, respond=respond)
+    h.show(ack=ack, action={"value": "nope"}, body=body(), respond=respond)
     assert len(ack.calls) == 1 and "見つかりません" in respond.last["text"]
     ack, respond = Recorder(), Recorder()
     h.remove(ack=ack, action={"value": "nope|2026-10-05|x"}, body=body(), respond=respond)
@@ -288,3 +288,116 @@ def test_handlers_reject_unknown_canvas_mode(repo):
 def test_menu_escapes_meeting_name(repo):
     m = service.register_meeting(repo, "C1", ADMIN, "<!here> 定例", 0, "10:00", 30)
     assert "<!here>" not in str(views.menu([m]))
+
+
+# --- 第 2 回: 過去の会議の確定・中止（担当者だけ）・エラーの通知 ---
+
+from datetime import datetime  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+AFTER = datetime(2026, 10, 6, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo"))  # 10/5（月）の会議の後
+
+
+def _actions(blocks) -> list[str]:
+    return [e["action_id"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
+
+
+def test_show_offers_finalize_and_cancel_to_admins_only(repo, meeting):
+    service.add_draft(repo, meeting, TODAY, "A", "", 20, "", "UA")
+    h = Handlers(repo, admins={ADMIN}, now=lambda: AFTER)
+    respond = Recorder()
+    h.show(ack=Recorder(), action={"value": meeting.meeting_id}, body=body(ADMIN), respond=respond)
+    assert {views.A_FINALIZE, views.A_CANCEL} <= set(_actions(respond.last["blocks"]))
+    respond = Recorder()
+    h.show(ack=Recorder(), action={"value": meeting.meeting_id}, body=body(MEMBER), respond=respond)
+    assert not {views.A_FINALIZE, views.A_CANCEL} & set(_actions(respond.last["blocks"]))
+    assert "担当者が選びます" in str(respond.last["blocks"])
+    assert repo.drafts(meeting.meeting_id, "2026-10-05")[0].status == "proposed"  # 見ただけでは変わらない
+
+
+def test_finalize_and_cancel_require_admin(repo, meeting):
+    service.add_draft(repo, meeting, TODAY, "A", "", 20, "", "UA")
+    h = Handlers(repo, admins={ADMIN}, now=lambda: AFTER)
+    for method in (h.finalize, h.cancel):
+        ack, respond, client = Recorder(), Recorder(), FakeClient()
+        method(ack=ack, action={"value": f"{meeting.meeting_id}|2026-10-05"}, body=body(MEMBER), respond=respond, client=client)
+        assert len(ack.calls) == 1 and "担当者" in respond.last["text"] and client.calls == []
+    assert repo.drafts(meeting.meeting_id, "2026-10-05")[0].status == "proposed"
+    ack, respond, client = Recorder(), Recorder(), FakeClient()
+    h.finalize(ack=ack, action={"value": f"{meeting.meeting_id}|2026-10-05"}, body=body(ADMIN), respond=respond, client=client)
+    assert "確定しました（扱い済み 1 件" in respond.last["text"] and respond.last["replace_original"] is True
+    assert client.names() == ["chat_postMessage"]
+    assert repo.drafts(meeting.meeting_id, "2026-10-05")[0].status == "accepted"
+    # 2 回目（別の人が同時に押した など）は、理由を本人に返す
+    respond = Recorder()
+    h.cancel(ack=Recorder(), action={"value": f"{meeting.meeting_id}|2026-10-05"}, body=body(ADMIN), respond=respond, client=FakeClient())
+    assert "済んでいます" in respond.last["text"]
+
+
+def test_cancel_handler_moves_items(repo, meeting):
+    service.add_draft(repo, meeting, TODAY, "A", "", 20, "", "UA")
+    h = Handlers(repo, now=lambda: AFTER)
+    respond = Recorder()
+    h.cancel(ack=Recorder(), action={"value": f"{meeting.meeting_id}|2026-10-05"}, body=body(MEMBER), respond=respond, client=FakeClient())
+    assert "中止にしました（議題 1 件" in respond.last["text"]
+    assert [d.title for d in repo.drafts(meeting.meeting_id, "2026-10-12")] == ["A"]
+
+
+def test_error_reporter_logs_and_notifies(caplog):
+    reporter = app_mod.ErrorReporter("CADMIN")
+    respond, client = Recorder(), FakeClient()
+    b = {"user": {"id": "UX"}, "actions": [{"action_id": "agenda_canvas"}]}
+    with caplog.at_level("ERROR", logger="agenda_bot"):
+        reporter(RuntimeError("boom <secret>"), body=b, respond=respond, client=client)
+    assert "action:agenda_canvas" in caplog.text and "RuntimeError" in caplog.text
+    assert respond.last["response_type"] == "ephemeral" and "エラー" in respond.last["text"]
+    name, kw = client.calls[0]
+    assert name == "chat_postMessage" and kw["channel"] == "CADMIN"
+    assert "agenda_canvas" in kw["text"] and "<@UX>" in kw["text"] and "secret" not in kw["text"]  # 例外のメッセージ（中身）は送らない
+
+
+def test_error_reporter_without_channel_and_failing_notify(caplog):
+    class Broken(FakeClient):
+        def chat_postMessage(self, **kw):
+            raise RuntimeError("channel_not_found")
+
+    def bad_respond(**kw):
+        raise RuntimeError("expired")
+
+    app_mod.ErrorReporter("")(RuntimeError("x"), body={"command": "/agenda"}, respond=None, client=FakeClient())
+    with caplog.at_level("WARNING", logger="agenda_bot"):
+        app_mod.ErrorReporter("CADMIN")(RuntimeError("x"), body={"command": "/agenda"}, respond=bad_respond, client=Broken())
+    assert "知らせられませんでした" in caplog.text  # 通知の失敗で落ちない
+
+
+def test_build_app_registers_error_handler(repo):
+    pytest.importorskip("slack_bolt")
+    app = app_mod.build_app(repo, token="xoxb-test", token_verification_enabled=False, error_channel="CADMIN")
+    handler = app._listener_runner.listener_error_handler
+    assert type(handler).__name__ == "CustomListenerErrorHandler"
+    assert isinstance(handler.func, app_mod.ErrorReporter) and handler.func.error_channel == "CADMIN"
+
+
+def test_parse_channel():
+    assert app_mod.parse_channel("") == "" and app_mod.parse_channel(" C0123ABCD ") == "C0123ABCD"
+    with pytest.raises(ConfigError):
+        app_mod.parse_channel("#general")
+
+
+def test_env_example_has_no_aws_keys():
+    text = (app_mod.Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    keys = [line.split("=", 1)[0] for line in text.splitlines() if line and not line.startswith("#")]
+    assert "AWS_ACCESS_KEY_ID" not in keys and "AWS_SECRET_ACCESS_KEY" not in keys
+
+
+def test_local_dynamodb_uses_dummy_credentials(monkeypatch):
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE", "DYNAMODB_ENDPOINT"):
+        monkeypatch.delenv(k, raising=False)
+    assert app_mod.use_local_dynamodb() is False  # AWS では何もしない（ロール・プロファイルを使う）
+    monkeypatch.setenv("DYNAMODB_ENDPOINT", "http://localhost:8000")
+    assert app_mod.use_local_dynamodb() is True
+    import os
+
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "local"
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "already")
+    assert app_mod.use_local_dynamodb() is False and os.environ["AWS_ACCESS_KEY_ID"] == "already"

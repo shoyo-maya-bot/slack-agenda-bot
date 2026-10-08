@@ -5,7 +5,8 @@ from __future__ import annotations
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
+from datetime import time as Time  # Meeting.time（"10:00" の文字列）と名前がぶつからないように別名で使う
 
 from . import clock
 
@@ -48,8 +49,8 @@ class Meeting:
     owner: str  # Slack のユーザー ID
     default_minutes: int = 60
 
-    def start_time(self) -> time:
-        return time(int(self.time[:2]), int(self.time[3:5]))
+    def start_time(self) -> Time:
+        return Time(int(self.time[:2]), int(self.time[3:5]))
 
     def next_date(self, now: date | datetime) -> date:
         """次の開催日.
@@ -92,7 +93,8 @@ class DraftItem:
     created_by: str = ""
     # 出した順に並べるため、マイクロ秒まで持つ（同じ秒に出た議題の順が保存先の都合で入れ替わらないように）
     created_at: str = field(default_factory=created_at)
-    status: str = "proposed"  # proposed（出された）/ accepted（開催日に扱った）/ deferred（前の会議から繰り越した）
+    # proposed（出された）/ accepted（開催日に扱った。担当者が「確定」したとき）/ deferred（前の会議から繰り越した）
+    status: str = "proposed"
     carried_from: str = ""  # 繰り越した議題の、最初の開催日（YYYY-MM-DD）
 
 

@@ -1,4 +1,6 @@
 # pyproject.toml（extra: dev）から .github/workflows/deps-lock.yml が作る。手で直さない
+ast-serialize==0.12.1
+    # via mypy
 boto3==1.43.108
     # via
     #   slack-agenda-bot (pyproject.toml)
@@ -28,12 +30,20 @@ jmespath==1.1.0
     # via
     #   boto3
     #   botocore
+librt==0.16.0 ; platform_python_implementation != 'PyPy'
+    # via mypy
 markupsafe==3.0.4
     # via werkzeug
 moto==5.2.3
     # via slack-agenda-bot (pyproject.toml)
+mypy==2.4.0
+    # via slack-agenda-bot (pyproject.toml)
+mypy-extensions==1.1.0
+    # via mypy
 packaging==26.3
     # via pytest
+pathspec==1.1.1
+    # via mypy
 pluggy==1.6.0
     # via pytest
 py-partiql-parser==0.6.3
@@ -67,6 +77,8 @@ slack-bolt==1.30.0
     # via slack-agenda-bot (pyproject.toml)
 slack-sdk==3.45.0
     # via slack-bolt
+typing-extensions==4.16.0
+    # via mypy
 tzdata==2026.5 ; sys_platform == 'win32'
     # via slack-agenda-bot (pyproject.toml)
 urllib3==2.8.0

@@ -179,8 +179,16 @@ def test_dynamo_repository_with_moto(monkeypatch):
         after = datetime(2026, 10, 6, 9, 0, tzinfo=JST)
         v = service.agenda(repo, m, after)
         assert [(r["kind"], r["title"]) for r in v.rows] == [("固定", "振り返り"), ("繰越", "収まらない")]
+        assert v.unsettled == ["2026-10-05"]
+        # 見るだけでは状態を変えない
+        assert sorted((x.title, x.status) for x in repo.drafts(m.meeting_id, "2026-10-05")) == [
+            ("収まらない", "proposed"),
+            ("収まる", "proposed"),
+        ]
+        service.finalize(repo, m, "2026-10-05", after)
         assert [(x.title, x.status) for x in repo.drafts(m.meeting_id, "2026-10-05")] == [("収まる", "accepted")]
         assert repo.drafts_before(m.meeting_id, "2026-10-12") == []
+        assert [(x.title, x.status) for x in repo.drafts(m.meeting_id, "2026-10-12")] == [("収まらない", "deferred")]
 
 
 def test_app_wiring_registers_handlers(repo):
@@ -188,7 +196,7 @@ def test_app_wiring_registers_handlers(repo):
     from agenda_bot.app import build_app
 
     app = build_app(repo, token="xoxb-test", token_verification_enabled=False)
-    assert len(app._listeners) == 11  # /agenda 1、ボタン 7、モーダル 3
+    assert len(app._listeners) == 13  # /agenda 1、ボタン 9（確定・中止を含む）、モーダル 3
 
 
 # --- タイムゾーン: サーバーが UTC でも、設定したタイムゾーン（既定は Asia/Tokyo）の日付を使う ---
@@ -269,20 +277,26 @@ def test_overflow_is_carried_to_next_meeting(repo, meeting):
     service.add_draft(repo, meeting, after, "C（新しい）", "", 5, "", "UC")
     v = service.agenda(repo, meeting, after)
     assert v.meeting_date == date(2026, 10, 12)
-    # 繰り越した B が、後から出た C より先に入る（C は 30 分に収まらず次回へ）
+    # 繰り越した B が、後から出た C より先に入る（C は 30 分に収まらず次回へ）. 確定前でも見込みで並ぶ
     assert [(r["kind"], r["title"]) for r in v.rows] == [("固定", "振り返り"), ("繰越", "B（収まらない）")]
     assert [d.title for d in v.deferred] == ["C（新しい）"]
     assert "| 2 | 繰越 | B（収まらない） |" in v.markdown
-    # 元の開催日: 扱った A は accepted で残り、B は移った
+    assert v.unsettled == ["2026-10-05"]
+    # 担当者が「確定」: 扱った A は accepted で残り、B は移る
+    accepted, moved = service.finalize(repo, meeting, "2026-10-05", after)
+    assert [d.title for d in accepted] == ["A"] and [d.title for d in moved] == ["B（収まらない）"]
     old = repo.drafts(meeting.meeting_id, "2026-10-05")
     assert [(d.title, d.status) for d in old] == [("A", "accepted")]
-    moved = [d for d in repo.drafts(meeting.meeting_id, "2026-10-12") if d.title.startswith("B")][0]
-    assert moved.status == "deferred" and moved.carried_from == "2026-10-05"
-    # 何度呼んでも同じ（増えない・消えない）
+    moved_b = [d for d in repo.drafts(meeting.meeting_id, "2026-10-12") if d.title.startswith("B")][0]
+    assert moved_b.status == "deferred" and moved_b.carried_from == "2026-10-05"
+    # 確定の後も、並びは確定前の見込みと同じ（増えない・消えない）
     again = service.agenda(repo, meeting, after)
-    assert [r["title"] for r in again.rows] == [r["title"] for r in v.rows]
+    assert [r["title"] for r in again.rows] == [r["title"] for r in v.rows] and again.unsettled == []
+    # 2 回目の確定はできない
+    with pytest.raises(service.ValidationError, match="済んでいます"):
+        service.finalize(repo, meeting, "2026-10-05", after)
     # 繰り越した議題も、出した人が取り下げられる
-    service.remove_draft(repo, meeting, "2026-10-12", moved.item_id, "UB")
+    service.remove_draft(repo, meeting, "2026-10-12", moved_b.item_id, "UB")
     assert "B（収まらない）" not in [r["title"] for r in service.agenda(repo, meeting, after).rows]
 
 
@@ -293,7 +307,56 @@ def test_carry_over_across_skipped_weeks(repo, meeting):
     v = service.agenda(repo, meeting, date(2026, 10, 13))
     assert v.meeting_date == date(2026, 10, 19)
     assert [(r["kind"], r["title"]) for r in v.rows] == [("繰越", "B")]
+    assert v.unsettled == ["2026-10-05"]
+    service.finalize(repo, meeting, "2026-10-05", date(2026, 10, 13))  # 議題の無い 10/12 は飛ばし、B は 10/19 に移る
+    v = service.agenda(repo, meeting, date(2026, 10, 13))
+    assert [(r["kind"], r["title"]) for r in v.rows] == [("繰越", "B")] and v.unsettled == []
     assert [(d.title, d.status) for d in repo.drafts(meeting.meeting_id, "2026-10-05")] == [("A", "accepted")]
+    assert [(d.title, d.status) for d in repo.drafts(meeting.meeting_id, "2026-10-19")] == [("B", "deferred")]
+
+
+# --- 第 2 回: アジェンダを見るだけでは状態を変えない。確定・中止は担当者が選ぶ ---
+
+
+def _snapshot(repo) -> dict:
+    return {k: dict(v) for k, v in repo.t.items()}
+
+
+def test_reading_agenda_does_not_change_state(repo, meeting):
+    """読み取り（次回のアジェンダ・取り下げ後の表示・Canvas 用の Markdown）で「扱い済み」に書き換わっていた."""
+    service.add_draft(repo, meeting, TODAY, "A", "", 20, "", "UA")
+    service.add_draft(repo, meeting, TODAY, "B", "", 20, "", "UB")
+    before = _snapshot(repo)
+    after = datetime(2026, 10, 6, 9, 0, tzinfo=JST)
+    for _ in range(3):
+        v = service.agenda(repo, meeting, after)
+    assert _snapshot(repo) == before
+    assert [r["title"] for r in v.rows] == ["B"] and v.unsettled == ["2026-10-05"]
+
+
+def test_cancel_moves_everything_to_next_meeting(repo, meeting):
+    service.add_draft(repo, meeting, TODAY, "A", "", 20, "", "UA")
+    service.add_draft(repo, meeting, TODAY, "B", "", 20, "", "UB")
+    after = datetime(2026, 10, 6, 9, 0, tzinfo=JST)
+    moved = service.cancel(repo, meeting, "2026-10-05", after)
+    assert sorted(d.title for d in moved) == ["A", "B"]
+    assert repo.drafts(meeting.meeting_id, "2026-10-05") == []
+    left = repo.drafts(meeting.meeting_id, "2026-10-12")
+    assert {(d.title, d.status, d.carried_from) for d in left} == {("A", "deferred", "2026-10-05"), ("B", "deferred", "2026-10-05")}
+    v = service.agenda(repo, meeting, after)
+    assert [r["title"] for r in v.rows] == ["A"] and [d.title for d in v.deferred] == ["B"] and v.unsettled == []
+
+
+def test_settle_rules(repo, meeting):
+    service.add_draft(repo, meeting, TODAY, "A", "", 10, "", "UA")
+    with pytest.raises(service.ValidationError, match="まだ終わっていません"):
+        service.finalize(repo, meeting, "2026-10-05", TODAY)  # 会議の前
+    later = date(2026, 10, 13)
+    service.add_draft(repo, meeting, date(2026, 10, 6), "X", "", 10, "", "UA")  # 10/12 の議題
+    with pytest.raises(service.ValidationError, match="先に 2026-10-05"):
+        service.cancel(repo, meeting, "2026-10-12", later)  # 古い順に決める
+    with pytest.raises(service.ValidationError, match="形が違います"):
+        service.finalize(repo, meeting, "bad", later)
 
 
 # --- Canvas: 作った直後に ID を保存し、重複して作らない ---
@@ -418,3 +481,78 @@ def test_drafts_keep_order_with_coarse_clock(repo, meeting, monkeypatch):
     for t in titles:
         service.add_draft(repo, meeting, TODAY, t, "", 5, "", "UA")
     assert [r["title"] for r in service.agenda(repo, meeting, TODAY).rows] == titles
+
+
+# --- 第 2 回: Canvas の ID を保存できないときに、Canvas を重複して作らない ---
+
+
+class FlakySave(MemoryRepository):
+    """put_canvas が fail 回だけ失敗する保存先（DynamoDB の一時的なエラーの代わり）."""
+
+    def __init__(self, fail: int):
+        super().__init__()
+        self.fail = fail
+
+    def put_canvas(self, c):
+        if self.fail > 0:
+            self.fail -= 1
+            raise RuntimeError("ProvisionedThroughputExceeded")
+        super().put_canvas(c)
+
+
+class Deletable(FakeCanvas):
+    def __init__(self, can_delete: bool = True):
+        super().__init__()
+        self.can_delete = can_delete
+        self.n = 0
+
+    def canvases_create(self, **kw):
+        self.n += 1
+        self.calls.append(("create", kw))
+        return {"ok": True, "canvas_id": f"F_{self.n}"}
+
+    def canvases_delete(self, **kw):
+        self.calls.append(("delete", kw))
+        if not self.can_delete:
+            raise RuntimeError("canvas_deleting_disabled")
+        return {"ok": True}
+
+
+@pytest.fixture()
+def no_sleep(monkeypatch):
+    monkeypatch.setattr(service.time, "sleep", lambda s: None)
+
+
+def test_canvas_id_save_is_retried(no_sleep):
+    repo = FlakySave(fail=2)
+    m = service.register_meeting(repo, "C1", "UO", "定例", 0, "10:00", 30)
+    c = Deletable()
+    assert service.publish_canvas(repo, c, m, TODAY) == ("F_1", True)
+    assert repo.get_canvas(m.meeting_id, "2026-10-05").canvas_id == "F_1"
+    assert [k for k, _ in c.calls] == ["create", "access"]
+
+
+def test_canvas_save_failure_deletes_created_canvas_and_allows_retry(no_sleep):
+    """保存に失敗して「作成中」の印が残ると、5 分後に押したときに 2 つ目の Canvas ができていた."""
+    repo = FlakySave(fail=service.SAVE_ATTEMPTS)
+    m = service.register_meeting(repo, "C1", "UO", "定例", 0, "10:00", 30)
+    c = Deletable()
+    with pytest.raises(service.CanvasSaveError, match="消しました"):
+        service.publish_canvas(repo, c, m, TODAY)
+    assert [k for k, _ in c.calls] == ["create", "delete"] and c.calls[1][1] == {"canvas_id": "F_1"}
+    assert repo.get_canvas(m.meeting_id, "2026-10-05") is None  # 印を消したので、すぐ押し直せる
+    assert service.publish_canvas(repo, c, m, TODAY) == ("F_2", True)
+    assert [k for k, _ in c.calls].count("create") == 2 and [k for k, _ in c.calls].count("delete") == 1  # 残る Canvas は 1 つ
+
+
+def test_canvas_save_failure_keeps_pending_when_delete_fails(no_sleep, monkeypatch):
+    repo = FlakySave(fail=service.SAVE_ATTEMPTS)
+    m = service.register_meeting(repo, "C1", "UO", "定例", 0, "10:00", 30)
+    c = Deletable(can_delete=False)
+    with pytest.raises(service.CanvasSaveError, match="F_1"):  # 作った Canvas の ID を知らせる
+        service.publish_canvas(repo, c, m, TODAY)
+    rec = repo.get_canvas(m.meeting_id, "2026-10-05")
+    assert rec is not None and rec.canvas_id == service.PENDING  # 印は残す（勝手に 2 つ目を作らない）
+    with pytest.raises(service.Busy):
+        service.publish_canvas(repo, c, m, TODAY)
+    assert [k for k, _ in c.calls].count("create") == 1

@@ -13,7 +13,7 @@
 
 ### 操作できる人（AGENDA_ADMINS）
 
-| AGENDA_ADMINS | 会議の登録・固定の議題の追加と削除・Canvas への出力 | 議題を出す・見る・取り下げ |
+| AGENDA_ADMINS | 会議の登録・固定の議題の追加と削除・Canvas への出力・過去の会議の確定と中止 | 議題を出す・見る・取り下げ |
 |---|---|---|
 | 空（既定） | 誰でもできる | 誰でもできる |
 | `U0123ABCD,U0456EFGH` | 書いたユーザーだけ | 誰でもできる（取り下げは出した人と会議の担当者） |
@@ -30,7 +30,8 @@ Canvas を API で作る・更新するには Slack の **有料プラン** が�
 | `channel` | チャンネルの Canvas（1 チャンネル 1 つ）を毎回置き換える | 有料プラン、`canvases:write`。チャンネルに Canvas が既にあると `channel_canvas_already_exists` |
 | `standalone` | 開催日ごとに Canvas を作り、チャンネルに編集権限を付ける | 有料プラン、`canvases:write` |
 
-Canvas は、作った直後に ID を保存してから権限を付けます。権限の付与に失敗しても、もう一度押せば同じ Canvas を更新して権限を付け直します（重複して作りません）。
+Canvas は、作った直後に ID を保存してから権限を付けます。ID の保存が何度やっても失敗したときは、作った Canvas を消して「もう一度押してください」と出します
+（消せなかったときは Canvas の ID を出すので、手で消してから押し直してください。いずれも 2 つ目は作りません）。権限の付与に失敗しても、もう一度押せば同じ Canvas を更新して権限を付け直します（重複して作りません）。
 同時に押された・連打されたときは 1 人だけが作り、ほかの人には「作成中です」と出します。作成が途中で止まった場合は 5 分たつと作り直せます。
 
 ### タイムゾーン
@@ -60,7 +61,8 @@ python scripts/create_tables.py          # .env の DYNAMODB_ENDPOINT（http://l
 
 ### AWS
 
-1. `.env` の `DYNAMODB_ENDPOINT` を空にし、`AWS_ACCESS_KEY_ID` などは AWS の認証情報（プロファイル・ロール）を使う
+1. `.env` の `DYNAMODB_ENDPOINT` を空にし、AWS の認証情報は IAM ロール（ECS のタスクロールなど）か AWS CLI のプロファイル（`AWS_PROFILE`）を使う。
+   アクセスキーを `.env` に書かない（DynamoDB Local のときは、ボットがダミーの値を自動で使う）
 2. `python scripts/create_tables.py --aws`（オンデマンド課金のテーブルを作る）
 3. ボットを動かす場所（ECS・EC2 など）に、4 つのテーブルの読み書き権限だけを付ける
 

@@ -258,6 +258,45 @@ def settle_blocks(view: AgendaView, can_manage: bool) -> list[dict[str, Any]]:
     return blocks
 
 
+MAX_UNFIT_BUTTONS = 5  # 収まらない議題に「取り下げ」ボタンを付ける数（多ければ残りは名前だけ）
+
+
+def unfit_blocks(view: AgendaView) -> list[dict[str, Any]]:
+    """会議時間（固定の議題を除く）より長く、何度繰り越しても収まらない議題の警告と「取り下げ」ボタン.
+
+    会議を短くしたり固定の議題を足したりした後に残った議題は、アジェンダの行に出ないので、ここで取り下げられるようにする
+    （取り下げられるのは、出した本人・会議の登録者・AGENDA_ADMINS の担当者）。
+    """
+    if not view.unfit:
+        return []
+    m = view.meeting
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":warning: 次の {len(view.unfit)} 件は会議時間に収まりません（毎回次回へ繰り越されます）。"
+                "時間を短くして出し直すか、取り下げてください。",
+            },
+        }
+    ]
+    for d in view.unfit[:MAX_UNFIT_BUTTONS]:
+        since = f"・{d.carried_from} から繰越" if d.carried_from else ""
+        who = f" <@{d.created_by}>" if is_user_id(d.created_by) else ""
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": clip(f"• {esc(d.title)}（{d.minutes} 分{since}）{who}")},
+                "accessory": _btn("取り下げ", A_REMOVE_DRAFT, f"{m.meeting_id}|{view.meeting_date.isoformat()}|{d.item_id}"),
+            }
+        )
+    rest = view.unfit[MAX_UNFIT_BUTTONS:]
+    if rest:
+        text = join_within([f"{esc(d.title)}（{d.minutes} 分）" for d in rest], f"ほか {len(rest)} 件: ")
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text}]})
+    return blocks
+
+
 def agenda_blocks(
     view: AgendaView, user: str, can_manage: bool | None = None, max_blocks: int = MAX_MESSAGE_BLOCKS
 ) -> list[dict[str, Any]]:
@@ -281,6 +320,7 @@ def agenda_blocks(
     if view.deferred:
         text = join_within([esc(d.title) for d in view.deferred], "次回へ: ")
         tail.append({"type": "context", "elements": [{"type": "mrkdwn", "text": text}]})
+    tail += unfit_blocks(view)
     if not view.rows:
         tail.append({"type": "section", "text": {"type": "mrkdwn", "text": "まだ議題がありません。"}})
     if can_manage is not None:
@@ -290,7 +330,7 @@ def agenda_blocks(
     body: list[dict[str, Any]] = []
     for n, r in enumerate(rows, start=1):
         who = f" <@{r['presenter']}>" if is_user_id(r["presenter"]) else (f" {esc(r['presenter'])}" if r["presenter"] else "")
-        mark = "（繰越）" if r["kind"] == "繰越" else ""
+        mark = (f"（{r['carried_from']} から繰越）" if r.get("carried_from") else "（繰越）") if r["kind"] == "繰越" else ""
         sec: dict[str, Any] = {
             "type": "section",
             "text": {"type": "mrkdwn", "text": clip(f"{n}. *{esc(r['title'])}*{mark}（{r['minutes']} 分）{who}")},

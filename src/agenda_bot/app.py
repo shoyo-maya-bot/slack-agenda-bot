@@ -80,7 +80,10 @@ def canvas_mode_from_env() -> str:
 
 
 def parse_admins(value: str | None) -> frozenset[str]:
-    """AGENDA_ADMINS（カンマか空白で区切った Slack のユーザー ID）. 空なら空集合（誰でも操作できる）.
+    """AGENDA_ADMINS（カンマか空白で区切った Slack のユーザー ID）. 空なら空集合.
+
+    空集合のとき、固定の議題・Canvas への出力・確定と中止は、その会議の登録者だけができる（会議の登録は誰でもできる）。
+    会議の変更・削除は、空でも空でなくても、会議の登録者と AGENDA_ADMINS の担当者ができる（service.can_manage / can_edit_meeting）。
 
     ユーザー ID の形でないものは警告を出して使わない。指定はあるのに 1 つも使えなければ ConfigError
     （誰も操作できなくなる・誰でも操作できてしまう、のどちらにもしない）。
@@ -324,9 +327,11 @@ class Handlers:
             ack(**views.errors(e))
             return
         ack()
-        warning = service.fill_warning(self.repo, m)
-        if warning and client is not None:  # 固定の議題だけで会議時間が埋まる: 追加した本人に知らせる
-            client.chat_postEphemeral(channel=m.channel_id, user=body["user"]["id"], text=f":warning: {views.esc(m.name)}: {warning}")
+        # 固定の議題だけで会議時間が埋まる・出ている議題が収まらなくなった: 追加した本人に知らせる（追加は拒否しない）
+        warnings = [w for w in (service.fill_warning(self.repo, m), service.unfit_warning(self.repo, m)) if w]
+        if warnings and client is not None:
+            text = "\n".join(f":warning: {views.esc(m.name)}: {w}" for w in warnings)
+            client.chat_postEphemeral(channel=m.channel_id, user=body["user"]["id"], text=views.clip(text))
 
     def delete_fixed(self, ack, body, action, client):
         """固定の議題のモーダルの「削除」. 消したら同じモーダルを描き直す（結果はモーダルの上に出す）."""
@@ -389,10 +394,10 @@ class Handlers:
         )
         if moved:
             note += f" 議題 {len(moved)} 件の開催日を付け替えました。"
-        warning = service.fill_warning(self.repo, new)
-        if warning:
-            note += f"\n:warning: {warning}"
-        client.chat_postMessage(channel=new.channel_id, text=note)
+        for warning in (service.fill_warning(self.repo, new), service.unfit_warning(self.repo, new)):
+            if warning:  # 会議を短くして収まらなくなった議題は、出した人にメンションで知らせる（変更は拒否しない）
+                note += f"\n:warning: {warning}"
+        client.chat_postMessage(channel=new.channel_id, text=views.clip(note))
 
     def delete_meeting(self, ack, body, client, action, respond):
         ack()

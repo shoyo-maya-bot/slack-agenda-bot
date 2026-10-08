@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 
 from . import clock
 
@@ -13,6 +14,28 @@ WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
 
 def new_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+_created_lock = threading.Lock()
+_last_created: list[datetime] = []
+
+
+def created_at() -> str:
+    """議題を出した時刻（ISO 形式）. 出した順に並べるのに使う.
+
+    Windows の Python 3.12 などは時計の刻みが粗く（約 15 ms）、続けて出した議題が同じ時刻になることがある。
+    直前（1 秒以内）に出した時刻以下なら 1 マイクロ秒ずらして、同じプロセスの中では必ず後の時刻にする。
+    """
+    t = clock.now()
+    with _created_lock:
+        if _last_created:
+            last = _last_created[0]
+            if last - timedelta(seconds=1) < t <= last:
+                t = last + timedelta(microseconds=1)
+            _last_created[0] = t
+        else:
+            _last_created.append(t)
+    return t.isoformat()
 
 
 @dataclass
@@ -25,9 +48,22 @@ class Meeting:
     owner: str  # Slack のユーザー ID
     default_minutes: int = 60
 
-    def next_date(self, today: date) -> date:
-        """今日（設定したタイムゾーンの日付. clock.today()）を含めて次の開催日."""
-        return today + timedelta(days=(self.weekday - today.weekday()) % 7)
+    def start_time(self) -> time:
+        return time(int(self.time[:2]), int(self.time[3:5]))
+
+    def next_date(self, now: date | datetime) -> date:
+        """次の開催日.
+
+        now が日時（clock.now()）のとき: 今日の会議が終わった後（開始時刻＋会議時間を過ぎた後）なら翌週にする。
+        now が日付（clock.today()）のとき: 今日を含めて次の開催日（時刻は見ない）。
+        """
+        today = now.date() if isinstance(now, datetime) else now
+        day = today + timedelta(days=(self.weekday - today.weekday()) % 7)
+        if isinstance(now, datetime) and day == today:
+            end = datetime.combine(day, self.start_time(), tzinfo=now.tzinfo) + timedelta(minutes=self.default_minutes)
+            if now >= end:
+                day += timedelta(days=7)
+        return day
 
 
 @dataclass
@@ -54,8 +90,10 @@ class DraftItem:
     minutes: int = 10
     presenter: str = ""  # Slack のユーザー ID
     created_by: str = ""
-    created_at: str = field(default_factory=lambda: clock.now().isoformat(timespec="seconds"))
-    status: str = "proposed"  # proposed / accepted / deferred
+    # 出した順に並べるため、マイクロ秒まで持つ（同じ秒に出た議題の順が保存先の都合で入れ替わらないように）
+    created_at: str = field(default_factory=created_at)
+    status: str = "proposed"  # proposed（出された）/ accepted（開催日に扱った）/ deferred（前の会議から繰り越した）
+    carried_from: str = ""  # 繰り越した議題の、最初の開催日（YYYY-MM-DD）
 
 
 @dataclass
@@ -73,8 +111,9 @@ def to_dict(obj) -> dict:
 def build_agenda(
     meeting: Meeting, meeting_date: date, fixed: list[FixedItem], drafts: list[DraftItem]
 ) -> tuple[list[dict], int, list[DraftItem]]:
-    """固定議題 → 出された議題（受付順）の順に並べ、会議時間に収まらない議題は「次回へ」に回す.
+    """固定議題 → 前の会議から繰り越した議題 → 出された議題（受付順）の順に並べ、会議時間に収まらない議題は「次回へ」に回す.
 
+    取り下げ済み（accepted）の議題は並べない。
     戻り値: (並べた議題, 合計の分, 次回へ回した議題)
     """
     rows: list[dict] = []
@@ -83,21 +122,41 @@ def build_agenda(
         rows.append({"kind": "固定", "title": f.title, "minutes": f.minutes, "presenter": f.presenter, "detail": ""})
         total += f.minutes
     deferred: list[DraftItem] = []
-    for d in sorted((d for d in drafts if d.status != "deferred"), key=lambda x: x.created_at):
+    pending = (d for d in drafts if d.status != "accepted")
+    for d in sorted(pending, key=lambda x: (x.status != "deferred", x.carried_from or x.meeting_date, x.created_at)):
         if total + d.minutes > meeting.default_minutes:
             deferred.append(d)
             continue
         rows.append(
-            {"kind": "議題", "title": d.title, "minutes": d.minutes, "presenter": d.presenter, "detail": d.detail, "item_id": d.item_id}
+            {
+                "kind": "繰越" if d.status == "deferred" else "議題",
+                "title": d.title,
+                "minutes": d.minutes,
+                "presenter": d.presenter,
+                "detail": d.detail,
+                "item_id": d.item_id,
+            }
         )
         total += d.minutes
     return rows, total, deferred
 
 
+def canvas_text(text: str, *, cell: bool = True) -> str:
+    """Canvas の Markdown に入れる利用者の文字列を無害化する.
+
+    < と > は全角にして、<!channel> や <@U…> などの Slack の特殊な書式（一斉メンション）にならないようにする。
+    表のセル（cell=True）では | をエスケープし、改行を空白にする。
+    """
+    text = text.replace("<", "＜").replace(">", "＞")
+    if cell:
+        text = text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    return text
+
+
 def agenda_markdown(meeting: Meeting, meeting_date: date, rows: list[dict], total: int, deferred: list[DraftItem]) -> str:
     """Canvas 用の Markdown. ユーザーは <@U…> で書くと Canvas でメンションになる."""
     lines = [
-        f"# {meeting.name} アジェンダ（{meeting_date.isoformat()}（{WEEKDAYS[meeting_date.weekday()]}）{meeting.time}〜）",
+        f"# {canvas_text(meeting.name)} アジェンダ（{meeting_date.isoformat()}（{WEEKDAYS[meeting_date.weekday()]}）{meeting.time}〜）",
         "",
         f"合計 {total} 分 ／ 会議時間 {meeting.default_minutes} 分",
         "",
@@ -105,14 +164,14 @@ def agenda_markdown(meeting: Meeting, meeting_date: date, rows: list[dict], tota
         "|---|---|---|---|---|",
     ]
     for n, r in enumerate(rows, start=1):
-        who = f"<@{r['presenter']}>" if r["presenter"].startswith("U") else r["presenter"]
-        lines.append(f"| {n} | {r['kind']} | {r['title']} | {r['minutes']} 分 | {who} |")
+        who = f"<@{r['presenter']}>" if r["presenter"].startswith("U") else canvas_text(r["presenter"])
+        lines.append(f"| {n} | {r['kind']} | {canvas_text(r['title'])} | {r['minutes']} 分 | {who} |")
     details = [r for r in rows if r.get("detail")]
     if details:
         lines += ["", "## 議題の補足"]
         for r in details:
-            lines += ["", f"### {r['title']}", "", r["detail"]]
+            lines += ["", f"### {canvas_text(r['title'])}", "", canvas_text(r["detail"], cell=False)]
     if deferred:
-        lines += ["", "## 次回へ（時間に収まらなかった議題）", ""] + [f"- {d.title}（{d.minutes} 分）" for d in deferred]
+        lines += ["", "## 次回へ（時間に収まらなかった議題）", ""] + [f"- {canvas_text(d.title)}（{d.minutes} 分）" for d in deferred]
     lines += ["", "## メモ", "", "- ", ""]
     return "\n".join(lines)

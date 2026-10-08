@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any, Protocol
@@ -53,13 +54,73 @@ def _minutes(value: str | int, field: str) -> int:
     return n
 
 
-def register_meeting(repo: Repository, channel_id: str, owner: str, name: str, weekday: int, time: str, minutes: str | int) -> Meeting:
-    name = _title(name, "name", "会議名")
+def _time(time: str) -> str:
+    time = (time or "").strip()
     if not (len(time) == 5 and time[2] == ":" and time.replace(":", "").isdigit() and int(time[:2]) < 24 and int(time[3:]) < 60):
         raise ValidationError("time", "時刻は 10:00 の形で入れてください")
-    m = Meeting(new_id(), channel_id, name, int(weekday), time, owner, _minutes(minutes, "minutes"))
+    return time
+
+
+def _weekday(value: str | int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValidationError("weekday", "曜日を選んでください") from None
+    if not 0 <= n <= 6:
+        raise ValidationError("weekday", "曜日を選んでください")
+    return n
+
+
+def register_meeting(repo: Repository, channel_id: str, owner: str, name: str, weekday: int, time: str, minutes: str | int) -> Meeting:
+    name = _title(name, "name", "会議名")
+    m = Meeting(new_id(), channel_id, name, _weekday(weekday), _time(time), owner, _minutes(minutes, "minutes"))
     repo.put_meeting(m)
     return m
+
+
+# --- 権限 ---
+
+
+def can_manage(meeting: Meeting | None, user: str, admins: Iterable[str] = ()) -> bool:
+    """確定・中止・Canvas への出力・固定の議題の変更ができるか.
+
+    AGENDA_ADMINS（admins）があれば、その担当者だけ。空なら、その会議の登録者（owner）だけ
+    （会議を指定しない操作 = 会議の登録は、空なら誰でもできる）。
+    """
+    admins = frozenset(admins)
+    if admins:
+        return user in admins
+    return meeting is None or user == meeting.owner
+
+
+def can_edit_meeting(meeting: Meeting, user: str, admins: Iterable[str] = ()) -> bool:
+    """会議の変更（曜日・時刻・長さ）と削除ができるか. 会議の登録者と AGENDA_ADMINS の担当者."""
+    return user == meeting.owner or user in frozenset(admins)
+
+
+# --- 会議時間と議題の時間 ---
+
+
+def fixed_minutes(repo: Repository, meeting_id: str) -> int:
+    """固定の議題の合計（分）."""
+    return sum(f.minutes for f in repo.fixed_items(meeting_id))
+
+
+def available_minutes(repo: Repository, meeting: Meeting) -> int:
+    """議題に使える時間（会議の長さ − 固定の議題の合計. 0 未満は 0）."""
+    return max(meeting.default_minutes - fixed_minutes(repo, meeting.meeting_id), 0)
+
+
+def fill_warning(repo: Repository, meeting: Meeting) -> str:
+    """固定の議題だけで会議時間が埋まる（または超える）なら、その警告文. 埋まらなければ空."""
+    fixed = fixed_minutes(repo, meeting.meeting_id)
+    if fixed < meeting.default_minutes:
+        return ""
+    over = "を超えています" if fixed > meeting.default_minutes else "と同じです"
+    return (
+        f"固定の議題の合計（{fixed} 分）が会議時間（{meeting.default_minutes} 分）{over}。"
+        "このままでは議題を出せません（固定の議題を減らすか、会議時間を延ばしてください）。"
+    )
 
 
 def add_fixed(
@@ -95,13 +156,26 @@ def add_draft(
     detail = (detail or "").strip()
     if len(detail) > MAX_DETAIL:
         raise ValidationError("detail", f"補足は {MAX_DETAIL} 文字以内で入れてください（今は {len(detail)} 文字）")
+    n = _minutes(minutes, "minutes")
+    room = available_minutes(repo, meeting)
+    if room <= 0:
+        raise ValidationError(
+            "minutes",
+            "固定の議題だけで会議時間が埋まっているため、議題を出せません（担当者に固定の議題か会議時間の見直しを頼んでください）",
+        )
+    if n > room:
+        # 会議時間に入らない議題は、何度繰り越しても扱えないので、出すときに弾く
+        raise ValidationError(
+            "minutes",
+            f"議題に使える時間は {room} 分までです（会議 {meeting.default_minutes} 分 − 固定の議題 {meeting.default_minutes - room} 分）",
+        )
     d = DraftItem(
         meeting.meeting_id,
         meeting.next_date(today).isoformat(),
         new_id(),
         title,
         detail,
-        _minutes(minutes, "minutes"),
+        n,
         presenter or user,
         user,
     )
@@ -109,8 +183,8 @@ def add_draft(
     return d
 
 
-def remove_draft(repo: Repository, meeting: Meeting, meeting_date: str, item_id: str, user: str) -> None:
-    """取り下げられるのは、出した本人か会議の担当者だけ.
+def remove_draft(repo: Repository, meeting: Meeting, meeting_date: str, item_id: str, user: str, admins: Iterable[str] = ()) -> None:
+    """取り下げられるのは、出した本人・会議の登録者・AGENDA_ADMINS の担当者（admins）だけ.
 
     アジェンダに「繰越」として見えている議題は、確定するまで元の開催日に保存されているので、そちらも探す。
     """
@@ -119,9 +193,58 @@ def remove_draft(repo: Repository, meeting: Meeting, meeting_date: str, item_id:
         d = next((x for x in repo.drafts_before(meeting.meeting_id, meeting_date, meeting.settled_through) if x.item_id == item_id), None)
     if d is None:
         raise ValidationError("item", "その議題は見つかりません（取り下げ済みかもしれません）")
-    if user not in (d.created_by, meeting.owner):
-        raise ValidationError("item", "議題を取り下げられるのは、出した人と会議の担当者だけです")
+    if user not in (d.created_by, meeting.owner) and user not in frozenset(admins):
+        raise ValidationError("item", "議題を取り下げられるのは、出した人と会議の担当者（会議の登録者・AGENDA_ADMINS）だけです")
     repo.delete_draft(meeting.meeting_id, d.meeting_date, item_id)
+
+
+FAR_FUTURE = "9999-12-31"
+
+
+def update_meeting(
+    repo: Repository,
+    meeting: Meeting,
+    user: str,
+    weekday: str | int,
+    time: str,
+    minutes: str | int,
+    now: date | datetime,
+    admins: Iterable[str] = (),
+) -> tuple[Meeting, list[DraftItem]]:
+    """会議の曜日・時刻・長さを変える（登録者と AGENDA_ADMINS の担当者だけ）. → (変えた会議, 開催日を付け替えた議題).
+
+    次の開催日やその後に出ている議題は、新しい曜日・時刻の開催日へ付け替える（同じ週数だけ先の開催日へ）。
+    確定も中止もされていない過去の会議があるときは、先にそちらを決めてもらう（どの曜日の会議として扱うか曖昧になるため）。
+    """
+    if not can_edit_meeting(meeting, user, admins):
+        raise ValidationError("minutes", "会議を変更できるのは、会議の登録者と担当者（AGENDA_ADMINS）だけです")
+    new = replace(meeting, weekday=_weekday(weekday), time=_time(time), default_minutes=_minutes(minutes, "minutes"))
+    old_next = meeting.next_date(now)
+    pending = repo.drafts_before(meeting.meeting_id, FAR_FUTURE, meeting.settled_through)
+    past = sorted({d.meeting_date for d in pending if d.meeting_date < old_next.isoformat()})
+    if past:
+        raise ValidationError("minutes", f"先に {past[0]} の会議を確定か中止にしてください（「次回のアジェンダ」から選べます）")
+    new_next = new.next_date(now)
+    moved: list[DraftItem] = []
+    if new_next != old_next:
+        for d in pending:
+            shift = date.fromisoformat(d.meeting_date) - old_next
+            target = (new_next + shift).isoformat()
+            if target == d.meeting_date:
+                continue
+            nd = replace(d, meeting_date=target)
+            repo.put_draft(nd)  # 先に書いてから元を消す（途中で止まっても、議題は消えない）
+            repo.delete_draft(meeting.meeting_id, d.meeting_date, d.item_id)
+            moved.append(nd)
+    repo.put_meeting(new)
+    return new, moved
+
+
+def delete_meeting(repo: Repository, meeting: Meeting, user: str, admins: Iterable[str] = ()) -> None:
+    """会議を削除する（登録者と AGENDA_ADMINS の担当者だけ）. 固定の議題・議題・Canvas の記録も消す（Slack 側の Canvas は残る）."""
+    if not can_edit_meeting(meeting, user, admins):
+        raise ValidationError("meeting", "会議を削除できるのは、会議の登録者と担当者（AGENDA_ADMINS）だけです")
+    repo.delete_meeting(meeting.meeting_id)
 
 
 @dataclass

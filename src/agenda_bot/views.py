@@ -16,9 +16,12 @@ A_REMOVE_DRAFT = "agenda_remove_draft"
 A_DELETE_FIXED = "agenda_delete_fixed"
 A_FINALIZE = "agenda_finalize"
 A_CANCEL = "agenda_cancel"
+A_EDIT_MEETING = "agenda_edit_meeting"
+A_DELETE_MEETING = "agenda_delete_meeting"
 V_REGISTER = "agenda_view_register"
 V_DRAFT = "agenda_view_draft"
 V_FIXED = "agenda_view_fixed"
+V_EDIT_MEETING = "agenda_view_edit_meeting"
 
 # Slack の上限（Block Kit）. 超えると invalid_blocks で投稿・表示そのものが失敗する
 MAX_MESSAGE_BLOCKS = 50  # メッセージ（chat.postMessage・respond）のブロック数
@@ -57,6 +60,18 @@ def _btn(text: str, action: str, value: str, style: str = "") -> dict[str, Any]:
     if style:
         b["style"] = style
     return b
+
+
+def _confirm(button: dict[str, Any], title: str, text: str) -> dict[str, Any]:
+    """押した後に確認のダイアログを出す（削除など元に戻せない操作）."""
+    button["confirm"] = {
+        "title": {"type": "plain_text", "text": clip(title, 100)},
+        "text": {"type": "plain_text", "text": clip(text, 300)},
+        "confirm": {"type": "plain_text", "text": "削除する"},
+        "deny": {"type": "plain_text", "text": "やめる"},
+        "style": "danger",
+    }
+    return button
 
 
 def _input(block_id: str, label: str, element: dict[str, Any], optional: bool = False, hint: str = "") -> dict[str, Any]:
@@ -104,6 +119,12 @@ def menu(meetings: list[Meeting]) -> list[dict[str, Any]]:
                     _btn("次回のアジェンダ", A_SHOW, m.meeting_id),
                     _btn("固定の議題", A_FIXED, m.meeting_id),
                     _btn("Canvas に出す", A_CANVAS, m.meeting_id),
+                    _btn("会議の変更", A_EDIT_MEETING, m.meeting_id),
+                    _confirm(
+                        _btn("会議の削除", A_DELETE_MEETING, m.meeting_id, "danger"),
+                        "会議の削除",
+                        "この会議と、その固定の議題・出ている議題を消します。元に戻せません。",
+                    ),
                 ],
             },
             {"type": "divider"},
@@ -127,6 +148,29 @@ def register_modal() -> dict[str, Any]:
             _input("weekday", "曜日", {"type": "static_select", "action_id": "v", "options": days, "initial_option": days[0]}),
             _input("time", "開始時刻", _text("v", "10:00")),
             _input("minutes", "会議時間（分）", _text("v", "60"), hint="議題の合計がこれを超えると、後から出た議題は「次回へ」に回ります"),
+        ],
+    }
+
+
+def edit_meeting_modal(meeting: Meeting) -> dict[str, Any]:
+    """会議の変更（曜日・時刻・長さ）. 今の値を初期値に入れる."""
+    days = [{"text": {"type": "plain_text", "text": f"{w}曜"}, "value": str(i)} for i, w in enumerate(WEEKDAYS)]
+    return {
+        "type": "modal",
+        "callback_id": V_EDIT_MEETING,
+        "private_metadata": meeting.meeting_id,
+        "title": {"type": "plain_text", "text": "会議の変更"},
+        "submit": {"type": "plain_text", "text": "変更"},
+        "blocks": [
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*{esc(meeting.name)}*"}]},
+            _input(
+                "weekday",
+                "曜日",
+                {"type": "static_select", "action_id": "v", "options": days, "initial_option": days[meeting.weekday]},
+                hint="次の開催日とその後に出ている議題は、新しい曜日の開催日へ移ります",
+            ),
+            _input("time", "開始時刻", _text("v", meeting.time)),
+            _input("minutes", "会議時間（分）", _text("v", str(meeting.default_minutes))),
         ],
     }
 

@@ -34,6 +34,7 @@ TABLES: dict[str, dict[str, str]] = {
 class Repository(Protocol):
     def put_meeting(self, m: Meeting) -> None: ...
     def get_meeting(self, meeting_id: str) -> Meeting | None: ...
+    def delete_meeting(self, meeting_id: str) -> None: ...
     def meetings_in_channel(self, channel_id: str) -> list[Meeting]: ...
     def put_fixed(self, f: FixedItem) -> None: ...
     def delete_fixed(self, meeting_id: str, item_id: str) -> None: ...
@@ -90,6 +91,13 @@ class MemoryRepository:
     def get_meeting(self, meeting_id: str) -> Meeting | None:
         v = self.t["meetings"].get((meeting_id, ""))
         return _build(Meeting, v) if v else None
+
+    def delete_meeting(self, meeting_id: str) -> None:
+        """会議と、その固定の議題・議題・Canvas の記録を消す."""
+        with self._lock:
+            for table in TABLES:
+                for key in [k for k in self.t[table] if k[0] == meeting_id]:
+                    del self.t[table][key]
 
     def meetings_in_channel(self, channel_id: str) -> list[Meeting]:
         return [_build(Meeting, v) for v in self.t["meetings"].values() if v["channel_id"] == channel_id]
@@ -176,6 +184,15 @@ class DynamoRepository:
     def get_meeting(self, meeting_id: str) -> Meeting | None:
         v = self.tables["meetings"].get_item(Key={"meeting_id": meeting_id}).get("Item")
         return _build(Meeting, v) if v else None
+
+    def delete_meeting(self, meeting_id: str) -> None:
+        """会議と、その固定の議題・議題・Canvas の記録を消す. 子の記録を先に消し、会議は最後に消す（途中で止まっても、もう一度消せる）."""
+        for table in ("fixed_items", "drafts", "canvases"):
+            spec = TABLES[table]
+            with self.tables[table].batch_writer() as batch:
+                for item in self._query(table, meeting_id):
+                    batch.delete_item(Key={spec["pk"]: item[spec["pk"]], spec["sk"]: item[spec["sk"]]})
+        self.tables["meetings"].delete_item(Key={"meeting_id": meeting_id})
 
     def meetings_in_channel(self, channel_id: str) -> list[Meeting]:
         # 会議の数は少ない前提で scan（多くなったら channel_id の GSI を足す）

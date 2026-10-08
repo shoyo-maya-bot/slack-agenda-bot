@@ -166,11 +166,11 @@ def test_handlers_respond_within_limits(repo, meeting):
     h.show(noop, {"value": meeting.meeting_id}, {"user": {"id": "UA"}}, lambda **kw: sent.append(kw))
     d = repo.drafts(meeting.meeting_id, "2026-10-05")[0]
     h.remove(noop, {"value": f"{meeting.meeting_id}|2026-10-05|{d.item_id}"}, {"user": {"id": "UA"}}, lambda **kw: sent.append(kw))
-    h.canvas(noop, {"user": {"id": "UA"}}, {"value": meeting.meeting_id}, Client(), lambda **kw: sent.append(kw))
+    h.canvas(noop, {"user": {"id": "UOWNER"}}, {"value": meeting.meeting_id}, Client(), lambda **kw: sent.append(kw))
     # 確定（過去の開催日にする）
     later = date(2026, 10, 6)
     h2 = Handlers(repo, now=lambda: later)
-    h2.finalize(noop, {"value": f"{meeting.meeting_id}|2026-10-05"}, {"user": {"id": "UA"}}, lambda **kw: sent.append(kw), Client())
+    h2.finalize(noop, {"value": f"{meeting.meeting_id}|2026-10-05"}, {"user": {"id": "UOWNER"}}, lambda **kw: sent.append(kw), Client())
     with_blocks = [kw["blocks"] for kw in sent if "blocks" in kw]
     assert len(with_blocks) == 4
     for b in with_blocks:

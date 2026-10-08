@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as Time  # Meeting.time（"10:00" の文字列）と名前がぶつからないように別名で使う
 
 from . import clock
 
 WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
+
+# Slack のユーザー ID（U…、Enterprise Grid では W…）. AGENDA_ADMINS の検査とメンションの判定で同じ規則を使う
+USER_ID = re.compile(r"^[UW][A-Z0-9]+$")
+
+
+def is_user_id(value: str) -> bool:
+    """Slack のユーザー ID（U… / W…）か. そうなら <@…> でメンションにする."""
+    return bool(USER_ID.match(value or ""))
 
 
 def new_id() -> str:
@@ -48,6 +57,8 @@ class Meeting:
     time: str  # "10:00"
     owner: str  # Slack のユーザー ID
     default_minutes: int = 60
+    # 確定か中止を済ませた最後の開催日（YYYY-MM-DD）. これ以前の議題は扱い済みなので、繰り越しを探すときに読まない
+    settled_through: str = ""
 
     def start_time(self) -> Time:
         return Time(int(self.time[:2]), int(self.time[3:5]))
@@ -96,6 +107,17 @@ class DraftItem:
     # proposed（出された）/ accepted（開催日に扱った。担当者が「確定」したとき）/ deferred（前の会議から繰り越した）
     status: str = "proposed"
     carried_from: str = ""  # 繰り越した議題の、最初の開催日（YYYY-MM-DD）
+    # 扱い済み（accepted）にした議題を DynamoDB の TTL で消す時刻（UNIX 秒）. 0 は消さない（保存するときに属性ごと省く）
+    expires_at: int = 0
+
+
+ACCEPTED_RETENTION_DAYS = 180  # 扱い済みの議題を開催日から何日残すか（DynamoDB の TTL で消す）
+
+
+def accepted_expiry(meeting_date: str, days: int = ACCEPTED_RETENTION_DAYS) -> int:
+    """扱い済みの議題を消してよい時刻（開催日の days 日後の 0 時 UTC、UNIX 秒）."""
+    d = date.fromisoformat(meeting_date) + timedelta(days=days)
+    return int(datetime(d.year, d.month, d.day, tzinfo=UTC).timestamp())
 
 
 @dataclass
@@ -166,7 +188,7 @@ def agenda_markdown(meeting: Meeting, meeting_date: date, rows: list[dict], tota
         "|---|---|---|---|---|",
     ]
     for n, r in enumerate(rows, start=1):
-        who = f"<@{r['presenter']}>" if r["presenter"].startswith("U") else canvas_text(r["presenter"])
+        who = f"<@{r['presenter']}>" if is_user_id(r["presenter"]) else canvas_text(r["presenter"])
         lines.append(f"| {n} | {r['kind']} | {canvas_text(r['title'])} | {r['minutes']} 分 | {who} |")
     details = [r for r in rows if r.get("detail")]
     if details:

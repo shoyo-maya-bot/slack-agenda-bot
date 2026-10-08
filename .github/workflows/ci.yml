@@ -106,5 +106,10 @@ jobs:
           service.finalize(repo, m, "2026-10-05", date(2026, 10, 6))
           assert [(d.title, d.status) for d in repo.drafts(m.meeting_id, "2026-10-05")] == [("議題", "accepted")]
           assert [(d.title, d.status) for d in repo.drafts(m.meeting_id, "2026-10-12")] == [("長い議題", "deferred")]
+          # 確定した開催日を記録し（次から読まない）、扱い済みの議題には TTL 属性が入る
+          assert repo.get_meeting(m.meeting_id).settled_through == "2026-10-05"
+          assert repo.drafts(m.meeting_id, "2026-10-05")[0].expires_at > 0
+          ttl = repo.db.meta.client.describe_time_to_live(TableName="agenda_drafts")["TimeToLiveDescription"]
+          assert ttl.get("AttributeName") == "expires_at", ttl
           print(v.markdown)
           PY

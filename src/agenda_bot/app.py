@@ -16,13 +16,13 @@ from datetime import date, datetime
 from pathlib import Path
 
 from . import clock, service, views
+from .model import USER_ID as _USER_ID
 from .repository import DynamoRepository, Repository
 
 log = logging.getLogger("agenda_bot")
 
 CANVAS_MODES = ("message", "channel", "standalone")
 DEFAULT_CANVAS_MODE = "message"  # docs/setup.md と .env.example の既定に合わせる（無料プランでも動く）
-_USER_ID = re.compile(r"^[UW][A-Z0-9]{2,}$")
 
 
 class ConfigError(Exception):
@@ -280,8 +280,8 @@ class Handlers:
         respond(
             response_type="ephemeral",
             replace_original=True,
-            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}]
-            + views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", True),
+            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": views.clip(note)}]}]
+            + views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", True, max_blocks=views.MAX_MESSAGE_BLOCKS - 1),
             text=note,
         )
         client.chat_postMessage(channel=m.channel_id, text=f"<@{body['user']['id']}> さん: {views.esc(m.name)} の {note}")

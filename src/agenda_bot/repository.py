@@ -5,17 +5,23 @@
 |---|---|---|---|
 | meetings | meeting_id | - | 会議（チャンネル・曜日・時刻・時間） |
 | fixed_items | meeting_id | item_id | 固定議題 |
-| drafts | meeting_id | sk = 開催日#item_id | 次回に向けて出された議題 |
+| drafts | meeting_id | sk = 開催日#item_id | 次回に向けて出された議題（扱い済みは TTL 属性 expires_at で消える） |
 | canvases | meeting_id | meeting_date | 開催日ごとの Canvas の ID |
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import fields
+from datetime import date, timedelta
 from typing import Any, Protocol
 
 from .model import CanvasRecord, DraftItem, FixedItem, Meeting, to_dict
+
+log = logging.getLogger("agenda_bot")
+
+TTL_ATTRIBUTE = "expires_at"  # drafts の TTL 属性（扱い済みの議題だけに入れる）
 
 TABLES: dict[str, dict[str, str]] = {
     "meetings": {"pk": "meeting_id"},
@@ -35,11 +41,28 @@ class Repository(Protocol):
     def put_draft(self, d: DraftItem) -> None: ...
     def delete_draft(self, meeting_id: str, meeting_date: str, item_id: str) -> None: ...
     def drafts(self, meeting_id: str, meeting_date: str) -> list[DraftItem]: ...
-    def drafts_before(self, meeting_id: str, meeting_date: str) -> list[DraftItem]: ...
+    def drafts_before(self, meeting_id: str, meeting_date: str, since: str = "") -> list[DraftItem]: ...
+    def mark_settled(self, meeting_id: str, meeting_date: str) -> None: ...
     def put_canvas(self, c: CanvasRecord) -> None: ...
     def put_canvas_if(self, c: CanvasRecord, expected: CanvasRecord | None) -> bool: ...
     def delete_canvas(self, meeting_id: str, meeting_date: str) -> None: ...
     def get_canvas(self, meeting_id: str, meeting_date: str) -> CanvasRecord | None: ...
+
+
+def _draft_item(d: DraftItem) -> dict[str, Any]:
+    item = {**to_dict(d), "sk": f"{d.meeting_date}#{d.item_id}"}
+    if not item.get(TTL_ATTRIBUTE):
+        item.pop(TTL_ATTRIBUTE, None)  # 0 を入れると TTL が「1970 年に期限切れ」とみなして消してしまうので、属性ごと省く
+    return item
+
+
+def sk_range(meeting_date: str, since: str = "") -> tuple[str, str]:
+    """drafts_before のソートキーの範囲（両端を含む）. since（確定・中止を済ませた最後の開催日）の翌日から、meeting_date の前まで.
+
+    sk は「開催日#item_id」なので、上端を meeting_date（# の無い文字列）にすると、その日の議題は範囲に入らない。
+    """
+    lo = (date.fromisoformat(since) + timedelta(days=1)).isoformat() if since else "0"
+    return lo, meeting_date
 
 
 def _build(cls, item: dict[str, Any]):
@@ -51,6 +74,7 @@ class MemoryRepository:
     def __init__(self) -> None:
         self.t: dict[str, dict[tuple, dict]] = {k: {} for k in TABLES}
         self._lock = threading.Lock()  # 条件付きの書き込み（put_canvas_if）を DynamoDB と同じく 1 回の操作にする
+        self.read_count = 0  # drafts_before が読んだ（フィルター前の）件数. 全件読みしていないことをテストで確かめる
 
     def _put(self, table: str, item: dict) -> None:
         spec = TABLES[table]
@@ -80,7 +104,7 @@ class MemoryRepository:
         return [_build(FixedItem, v) for v in self._query("fixed_items", meeting_id)]
 
     def put_draft(self, d: DraftItem) -> None:
-        self._put("drafts", {**to_dict(d), "sk": f"{d.meeting_date}#{d.item_id}"})
+        self._put("drafts", _draft_item(d))
 
     def delete_draft(self, meeting_id: str, meeting_date: str, item_id: str) -> None:
         self.t["drafts"].pop((meeting_id, f"{meeting_date}#{item_id}"), None)
@@ -88,9 +112,18 @@ class MemoryRepository:
     def drafts(self, meeting_id: str, meeting_date: str) -> list[DraftItem]:
         return [_build(DraftItem, v) for v in self._query("drafts", meeting_id, f"{meeting_date}#")]
 
-    def drafts_before(self, meeting_id: str, meeting_date: str) -> list[DraftItem]:
-        """meeting_date より前の開催日の議題（扱い済みの accepted を除く）."""
-        return [_build(DraftItem, v) for v in self._query("drafts", meeting_id) if v["sk"] < meeting_date and v.get("status") != "accepted"]
+    def drafts_before(self, meeting_id: str, meeting_date: str, since: str = "") -> list[DraftItem]:
+        """meeting_date より前（since より後）の開催日の議題（扱い済みの accepted を除く）. 読んだ件数を read_count に足す."""
+        lo, hi = sk_range(meeting_date, since)
+        rows = [v for v in self._query("drafts", meeting_id) if lo <= v["sk"] <= hi]
+        self.read_count += len(rows)
+        return [_build(DraftItem, v) for v in rows if v.get("status") != "accepted"]
+
+    def mark_settled(self, meeting_id: str, meeting_date: str) -> None:
+        with self._lock:
+            v = self.t["meetings"].get((meeting_id, ""))
+            if v is not None and v.get("settled_through", "") < meeting_date:
+                v["settled_through"] = meeting_date
 
     def put_canvas(self, c: CanvasRecord) -> None:
         self._put("canvases", to_dict(c))
@@ -166,7 +199,7 @@ class DynamoRepository:
         return [_build(FixedItem, v) for v in self._query("fixed_items", meeting_id)]
 
     def put_draft(self, d: DraftItem) -> None:
-        self.tables["drafts"].put_item(Item={**to_dict(d), "sk": f"{d.meeting_date}#{d.item_id}"})
+        self.tables["drafts"].put_item(Item=_draft_item(d))
 
     def delete_draft(self, meeting_id: str, meeting_date: str, item_id: str) -> None:
         self.tables["drafts"].delete_item(Key={"meeting_id": meeting_id, "sk": f"{meeting_date}#{item_id}"})
@@ -174,12 +207,16 @@ class DynamoRepository:
     def drafts(self, meeting_id: str, meeting_date: str) -> list[DraftItem]:
         return [_build(DraftItem, v) for v in self._query("drafts", meeting_id, f"{meeting_date}#")]
 
-    def drafts_before(self, meeting_id: str, meeting_date: str) -> list[DraftItem]:
-        """meeting_date より前の開催日の議題（扱い済みの accepted を除く）."""
+    def drafts_before(self, meeting_id: str, meeting_date: str, since: str = "") -> list[DraftItem]:
+        """meeting_date より前（since より後）の開催日の議題（扱い済みの accepted を除く）.
+
+        ソートキーの範囲（キー条件）で、確定・中止を済ませた開催日より前を読まない（扱い済みの議題が増えても読む量が増えない）。
+        """
         from boto3.dynamodb.conditions import Attr, Key
 
+        lo, hi = sk_range(meeting_date, since)
         kw: dict[str, Any] = {
-            "KeyConditionExpression": Key("meeting_id").eq(meeting_id) & Key("sk").lt(meeting_date),
+            "KeyConditionExpression": Key("meeting_id").eq(meeting_id) & Key("sk").between(lo, hi),
             "FilterExpression": Attr("status").ne("accepted"),
         }
         items: list[dict] = []
@@ -189,6 +226,21 @@ class DynamoRepository:
             if "LastEvaluatedKey" not in res:
                 return [_build(DraftItem, v) for v in items]
             kw["ExclusiveStartKey"] = res["LastEvaluatedKey"]
+
+    def mark_settled(self, meeting_id: str, meeting_date: str) -> None:
+        """確定・中止を済ませた最後の開催日を記録する（新しい日付のときだけ. 会議のほかの項目は書き換えない）."""
+        from botocore.exceptions import ClientError
+
+        try:
+            self.tables["meetings"].update_item(
+                Key={"meeting_id": meeting_id},
+                UpdateExpression="SET settled_through = :d",
+                ConditionExpression="attribute_exists(meeting_id) AND (attribute_not_exists(settled_through) OR settled_through < :d)",
+                ExpressionAttributeValues={":d": meeting_date},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
 
     def put_canvas(self, c: CanvasRecord) -> None:
         self.tables["canvases"].put_item(Item=to_dict(c))
@@ -235,4 +287,15 @@ def create_tables(resource: Any, prefix: str = "agenda_") -> list[str]:
             attrs.append({"AttributeName": spec["sk"], "AttributeType": "S"})
         resource.create_table(TableName=full, KeySchema=keys, AttributeDefinitions=attrs, BillingMode="PAY_PER_REQUEST").wait_until_exists()
         made.append(full)
+    enable_ttl(resource, prefix + "drafts")
     return made
+
+
+def enable_ttl(resource: Any, table_name: str) -> bool:
+    """drafts の TTL（expires_at）を有効にする. 既に有効なら何もしない. → 今回有効にしたか."""
+    client = resource.meta.client
+    desc = client.describe_time_to_live(TableName=table_name).get("TimeToLiveDescription", {})
+    if desc.get("AttributeName") == TTL_ATTRIBUTE and desc.get("TimeToLiveStatus") in ("ENABLED", "ENABLING"):
+        return False
+    client.update_time_to_live(TableName=table_name, TimeToLiveSpecification={"Enabled": True, "AttributeName": TTL_ATTRIBUTE})
+    return True

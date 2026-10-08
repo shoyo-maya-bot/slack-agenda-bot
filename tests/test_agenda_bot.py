@@ -49,7 +49,7 @@ def test_agenda_orders_fixed_then_drafts_and_defers_overflow(repo, meeting):
     service.add_fixed(repo, meeting.meeting_id, "先週の振り返り", 10)
     service.add_fixed(repo, meeting.meeting_id, "課題の確認", 5, order=1)
     a = service.add_draft(repo, meeting, TODAY, "リリース日の判断", "決めたいこと: 日付", 10, "", "UA")
-    service.add_draft(repo, meeting, TODAY, "長い議題", "", 20, "UB", "UB")
+    service.add_draft(repo, meeting, TODAY, "長い議題", "", 10, "UB", "UB")
     v = service.agenda(repo, meeting, TODAY)
     assert v.meeting_date == date(2026, 10, 5)
     assert [r["title"] for r in v.rows] == ["課題の確認", "先週の振り返り", "リリース日の判断"]
@@ -123,7 +123,14 @@ def test_publish_canvas_channel_mode(repo, meeting):
 def test_views(repo, meeting):
     assert views.menu([])[1]["elements"][0]["action_id"] == views.A_REGISTER
     blocks = views.menu([meeting])
-    assert [e["action_id"] for e in blocks[1]["elements"]] == [views.A_ADD_DRAFT, views.A_SHOW, views.A_FIXED, views.A_CANVAS]
+    assert [e["action_id"] for e in blocks[1]["elements"]] == [
+        views.A_ADD_DRAFT,
+        views.A_SHOW,
+        views.A_FIXED,
+        views.A_CANVAS,
+        views.A_EDIT_MEETING,
+        views.A_DELETE_MEETING,
+    ]
     d = service.add_draft(repo, meeting, TODAY, "議題", "", 5, "", "UA")
     ab = views.agenda_blocks(service.agenda(repo, meeting, TODAY), "UA")
     assert ab[2]["accessory"]["value"] == f"{meeting.meeting_id}|{d.meeting_date}|{d.item_id}"
@@ -196,7 +203,7 @@ def test_app_wiring_registers_handlers(repo):
     from agenda_bot.app import build_app
 
     app = build_app(repo, token="xoxb-test", token_verification_enabled=False)
-    assert len(app._listeners) == 13  # /agenda 1、ボタン 9（確定・中止を含む）、モーダル 3
+    assert len(app._listeners) == 16  # /agenda 1、ボタン 11（確定・中止・会議の変更と削除を含む）、モーダル 4
 
 
 # --- タイムゾーン: サーバーが UTC でも、設定したタイムゾーン（既定は Asia/Tokyo）の日付を使う ---

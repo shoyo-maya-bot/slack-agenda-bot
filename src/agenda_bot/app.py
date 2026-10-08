@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import clock, service, views
 from .model import USER_ID as _USER_ID
+from .model import Meeting
 from .repository import DynamoRepository, Repository
 
 log = logging.getLogger("agenda_bot")
@@ -123,7 +124,9 @@ def now_in(tz: str | None = None) -> Callable[[], datetime]:
 
 
 NOT_FOUND = "その会議は見つかりません（削除されたか、別のワークスペースのものかもしれません）。`/agenda` からやり直してください。"
-NOT_ALLOWED = "この操作（会議の登録・固定の議題・Canvas への出力・会議の確定と中止）ができるのは、設定された担当者だけです。"
+NOT_ALLOWED = "この操作（固定の議題・Canvas への出力・会議の確定と中止）ができるのは、担当者（AGENDA_ADMINS。空なら会議の登録者）だけです。"
+NOT_ALLOWED_EDIT = "会議の変更・削除ができるのは、会議の登録者と担当者（AGENDA_ADMINS）だけです。"
+NOT_ALLOWED_REGISTER = "会議を登録できるのは、設定された担当者（AGENDA_ADMINS）だけです。"
 
 
 class Handlers:
@@ -147,9 +150,12 @@ class Handlers:
 
     # --- 共通 ---
 
-    def can_manage(self, user: str) -> bool:
-        """会議の登録・固定の議題・Canvas への出力・過去の会議の確定と中止ができるか. AGENDA_ADMINS が空なら誰でもできる."""
-        return not self.admins or user in self.admins
+    def can_manage(self, user: str, meeting: Meeting | None = None) -> bool:
+        """固定の議題・Canvas への出力・過去の会議の確定と中止ができるか（meeting を渡す）、会議を登録できるか（meeting なし）.
+
+        AGENDA_ADMINS があればその担当者だけ。空なら、その会議の登録者だけ（会議の登録は誰でもできる）。
+        """
+        return service.can_manage(meeting, user, self.admins)
 
     @staticmethod
     def _say(respond, text: str) -> None:
@@ -166,7 +172,7 @@ class Handlers:
     def register(self, ack, body, client, respond):
         ack()
         if not self.can_manage(body["user"]["id"]):
-            self._say(respond, NOT_ALLOWED)
+            self._say(respond, NOT_ALLOWED_REGISTER)
             return
         modal = views.register_modal()
         modal["private_metadata"] = body["channel"]["id"]
@@ -174,7 +180,7 @@ class Handlers:
 
     def register_submit(self, ack, body, view, client):
         if not self.can_manage(body["user"]["id"]):
-            ack(**views.errors(service.ValidationError("name", NOT_ALLOWED)))
+            ack(**views.errors(service.ValidationError("name", NOT_ALLOWED_REGISTER)))
             return
         v = views.values(view)
         try:
@@ -232,7 +238,7 @@ class Handlers:
         respond(
             response_type="ephemeral",
             replace_original=False,
-            blocks=views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", self.can_manage(body["user"]["id"])),
+            blocks=views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", self.can_manage(body["user"]["id"], m)),
             text="アジェンダ",
         )
 
@@ -244,14 +250,14 @@ class Handlers:
             self._say(respond, NOT_FOUND)
             return
         try:
-            service.remove_draft(self.repo, m, parts[1], parts[2], body["user"]["id"])
+            service.remove_draft(self.repo, m, parts[1], parts[2], body["user"]["id"], self.admins)
         except service.ValidationError as e:
             self._say(respond, str(e))
             return
         respond(
             response_type="ephemeral",
             replace_original=True,
-            blocks=views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", self.can_manage(body["user"]["id"])),
+            blocks=views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", self.can_manage(body["user"]["id"], m)),
             text="取り下げました",
         )
 
@@ -259,13 +265,13 @@ class Handlers:
 
     def _settle(self, ack, action, body, respond, client, op: str) -> None:
         ack()
-        if not self.can_manage(body["user"]["id"]):
-            self._say(respond, NOT_ALLOWED)
-            return
         meeting_id, _, meeting_date = action["value"].partition("|")
         m = self.repo.get_meeting(meeting_id)
         if m is None:
             self._say(respond, NOT_FOUND)
+            return
+        if not self.can_manage(body["user"]["id"], m):
+            self._say(respond, NOT_ALLOWED)
             return
         try:
             if op == "finalize":
@@ -300,23 +306,27 @@ class Handlers:
         if m is None:
             self._say(respond, NOT_FOUND)
             return
-        modal = views.fixed_modal(m, self.repo.fixed_items(m.meeting_id), self.can_manage(body["user"]["id"]))
+        modal = views.fixed_modal(m, self.repo.fixed_items(m.meeting_id), self.can_manage(body["user"]["id"], m))
         client.views_open(trigger_id=body["trigger_id"], view=modal)
 
-    def fixed_submit(self, ack, body, view):
-        if not self.can_manage(body["user"]["id"]):
-            ack(**views.errors(service.ValidationError("title", NOT_ALLOWED)))
-            return
-        if self.repo.get_meeting(view["private_metadata"]) is None:
+    def fixed_submit(self, ack, body, view, client=None):
+        m = self.repo.get_meeting(view["private_metadata"])
+        if m is None:
             ack(**views.errors(service.ValidationError("title", NOT_FOUND)))
+            return
+        if not self.can_manage(body["user"]["id"], m):
+            ack(**views.errors(service.ValidationError("title", NOT_ALLOWED)))
             return
         v = views.values(view)
         try:
-            service.add_fixed(self.repo, view["private_metadata"], v.get("title", ""), v.get("minutes", ""))
+            service.add_fixed(self.repo, m.meeting_id, v.get("title", ""), v.get("minutes", ""))
         except service.ValidationError as e:
             ack(**views.errors(e))
             return
         ack()
+        warning = service.fill_warning(self.repo, m)
+        if warning and client is not None:  # 固定の議題だけで会議時間が埋まる: 追加した本人に知らせる
+            client.chat_postEphemeral(channel=m.channel_id, user=body["user"]["id"], text=f":warning: {views.esc(m.name)}: {warning}")
 
     def delete_fixed(self, ack, body, action, client):
         """固定の議題のモーダルの「削除」. 消したら同じモーダルを描き直す（結果はモーダルの上に出す）."""
@@ -325,7 +335,7 @@ class Handlers:
         m = self.repo.get_meeting(meeting_id)
         if m is None:
             note = NOT_FOUND
-        elif not self.can_manage(body["user"]["id"]):
+        elif not self.can_manage(body["user"]["id"], m):
             note = NOT_ALLOWED
         else:
             try:
@@ -342,20 +352,77 @@ class Handlers:
                 "blocks": [],
             }
         else:
-            modal = views.fixed_modal(m, self.repo.fixed_items(m.meeting_id), self.can_manage(body["user"]["id"]))
+            modal = views.fixed_modal(m, self.repo.fixed_items(m.meeting_id), self.can_manage(body["user"]["id"], m))
         modal["blocks"].insert(0, {"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
         client.views_update(view_id=body["view"]["id"], hash=body["view"].get("hash"), view=modal)
+
+    # --- 会議の変更・削除（登録者と AGENDA_ADMINS の担当者） ---
+
+    def edit_meeting(self, ack, body, client, action, respond):
+        ack()
+        m = self.repo.get_meeting(action["value"])
+        if m is None:
+            self._say(respond, NOT_FOUND)
+            return
+        if not service.can_edit_meeting(m, body["user"]["id"], self.admins):
+            self._say(respond, NOT_ALLOWED_EDIT)
+            return
+        client.views_open(trigger_id=body["trigger_id"], view=views.edit_meeting_modal(m))
+
+    def edit_meeting_submit(self, ack, body, view, client):
+        m = self.repo.get_meeting(view["private_metadata"])
+        if m is None:
+            ack(**views.errors(service.ValidationError("minutes", NOT_FOUND)))
+            return
+        v = views.values(view)
+        try:
+            new, moved = service.update_meeting(
+                self.repo, m, body["user"]["id"], v.get("weekday", ""), v.get("time", ""), v.get("minutes", ""), self.now(), self.admins
+            )
+        except service.ValidationError as e:
+            ack(**views.errors(e))
+            return
+        ack()
+        note = (
+            f"<@{body['user']['id']}> さんが会議「{views.esc(new.name)}」を変更しました"
+            f"（毎週{views.WEEKDAYS[new.weekday]}曜 {new.time}〜、{new.default_minutes} 分）。"
+        )
+        if moved:
+            note += f" 議題 {len(moved)} 件の開催日を付け替えました。"
+        warning = service.fill_warning(self.repo, new)
+        if warning:
+            note += f"\n:warning: {warning}"
+        client.chat_postMessage(channel=new.channel_id, text=note)
+
+    def delete_meeting(self, ack, body, client, action, respond):
+        ack()
+        m = self.repo.get_meeting(action["value"])
+        if m is None:
+            self._say(respond, NOT_FOUND)
+            return
+        try:
+            service.delete_meeting(self.repo, m, body["user"]["id"], self.admins)
+        except service.ValidationError:
+            self._say(respond, NOT_ALLOWED_EDIT)
+            return
+        respond(
+            response_type="ephemeral",
+            replace_original=True,
+            blocks=views.menu(self.repo.meetings_in_channel(m.channel_id)),
+            text="会議を削除しました",
+        )
+        client.chat_postMessage(channel=m.channel_id, text=f"<@{body['user']['id']}> さんが会議「{views.esc(m.name)}」を削除しました。")
 
     # --- Canvas ---
 
     def canvas(self, ack, body, action, client, respond):
         ack()
-        if not self.can_manage(body["user"]["id"]):
-            self._say(respond, NOT_ALLOWED)
-            return
         m = self.repo.get_meeting(action["value"])
         if m is None:
             self._say(respond, NOT_FOUND)
+            return
+        if not self.can_manage(body["user"]["id"], m):
+            self._say(respond, NOT_ALLOWED)
             return
         if self.canvas_mode == "message":  # Canvas を使えないプラン向け: チャンネルにアジェンダを投稿する
             v = service.agenda(self.repo, m, self.now())
@@ -454,6 +521,9 @@ def build_app(
     app.action(views.A_CANVAS)(h.canvas)
     app.action(views.A_FINALIZE)(h.finalize)
     app.action(views.A_CANCEL)(h.cancel)
+    app.action(views.A_EDIT_MEETING)(h.edit_meeting)
+    app.view(views.V_EDIT_MEETING)(h.edit_meeting_submit)
+    app.action(views.A_DELETE_MEETING)(h.delete_meeting)
     return app
 
 

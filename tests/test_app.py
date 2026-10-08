@@ -247,16 +247,42 @@ def test_admins_restrict_register_fixed_and_canvas(repo, meeting):
     assert client.calls[0][0] == "views_update" and client.calls[0][1]["view_id"] == "V1"
 
 
-def test_without_admins_anyone_can_manage(repo, meeting):
+def test_without_admins_only_meeting_owner_can_manage(repo, meeting):
+    """AGENDA_ADMINS が空なら、会議の登録者（ここでは ADMIN）だけが固定の議題・Canvas・確定・中止を操作できる."""
     h = handlers(repo)
+    state = {"private_metadata": meeting.meeting_id, "state": modal_state(title="振り返り", minutes="5")}
     ack = Recorder()
-    h.fixed_submit(
-        ack=ack, body=body(MEMBER), view={"private_metadata": meeting.meeting_id, "state": modal_state(title="振り返り", minutes="5")}
-    )
+    h.fixed_submit(ack=ack, body=body(MEMBER), view=state)
+    assert ack.last["response_action"] == "errors" and repo.fixed_items(meeting.meeting_id) == []
+    ack = Recorder()
+    h.fixed_submit(ack=ack, body=body(ADMIN), view=state)
     assert ack.calls == [{}] and [f.title for f in repo.fixed_items(meeting.meeting_id)] == ["振り返り"]
+    client, respond = FakeClient(), Recorder()
+    h.canvas(ack=Recorder(), body=body(MEMBER), action={"value": meeting.meeting_id}, client=client, respond=respond)
+    assert client.calls == [] and "登録者" in respond.last["text"]
     client = FakeClient()
-    h.canvas(ack=Recorder(), body=body(MEMBER), action={"value": meeting.meeting_id}, client=client, respond=Recorder())
+    h.canvas(ack=Recorder(), body=body(ADMIN), action={"value": meeting.meeting_id}, client=client, respond=Recorder())
     assert client.names() == ["chat_postMessage"]  # 既定は message モード
+    # 会議の登録そのものは、AGENDA_ADMINS が空なら誰でもできる
+    client = FakeClient()
+    h.register(ack=Recorder(), body=body(MEMBER), client=client, respond=Recorder())
+    assert client.names() == ["views_open"]
+
+
+def test_without_admins_only_meeting_owner_can_settle(repo, meeting):
+    service.add_draft(repo, meeting, TODAY, "A", "", 20, "", "UA")
+    h = Handlers(repo, now=lambda: AFTER)
+    respond = Recorder()
+    h.show(ack=Recorder(), action={"value": meeting.meeting_id}, body=body(MEMBER), respond=respond)
+    assert not {views.A_FINALIZE, views.A_CANCEL} & set(_actions(respond.last["blocks"]))
+    for method in (h.finalize, h.cancel):
+        respond, client = Recorder(), FakeClient()
+        method(ack=Recorder(), action={"value": f"{meeting.meeting_id}|2026-10-05"}, body=body(MEMBER), respond=respond, client=client)
+        assert "登録者" in respond.last["text"] and client.calls == []
+    assert repo.drafts(meeting.meeting_id, "2026-10-05")[0].status == "proposed"
+    respond = Recorder()
+    h.show(ack=Recorder(), action={"value": meeting.meeting_id}, body=body(ADMIN), respond=respond)
+    assert {views.A_FINALIZE, views.A_CANCEL} <= set(_actions(respond.last["blocks"]))
 
 
 def test_canvas_errors_are_reported(repo, meeting):
@@ -266,7 +292,7 @@ def test_canvas_errors_are_reported(repo, meeting):
 
     ack, respond = Recorder(), Recorder()
     handlers(repo, canvas_mode="standalone").canvas(
-        ack=ack, body=body(), action={"value": meeting.meeting_id}, client=Broken(), respond=respond
+        ack=ack, body=body(ADMIN), action={"value": meeting.meeting_id}, client=Broken(), respond=respond
     )
     assert len(ack.calls) == 1 and "Canvas に出せませんでした" in respond.last["text"]
 
@@ -338,7 +364,7 @@ def test_cancel_handler_moves_items(repo, meeting):
     service.add_draft(repo, meeting, TODAY, "A", "", 20, "", "UA")
     h = Handlers(repo, now=lambda: AFTER)
     respond = Recorder()
-    h.cancel(ack=Recorder(), action={"value": f"{meeting.meeting_id}|2026-10-05"}, body=body(MEMBER), respond=respond, client=FakeClient())
+    h.cancel(ack=Recorder(), action={"value": f"{meeting.meeting_id}|2026-10-05"}, body=body(ADMIN), respond=respond, client=FakeClient())
     assert "中止にしました（議題 1 件" in respond.last["text"]
     assert [d.title for d in repo.drafts(meeting.meeting_id, "2026-10-12")] == ["A"]
 

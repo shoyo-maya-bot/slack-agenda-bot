@@ -159,6 +159,7 @@ def build_agenda(
                 "presenter": d.presenter,
                 "detail": d.detail,
                 "item_id": d.item_id,
+                "carried_from": d.carried_from if d.status == "deferred" else "",
             }
         )
         total += d.minutes

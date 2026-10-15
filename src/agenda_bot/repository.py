@@ -34,6 +34,7 @@ TABLES: dict[str, dict[str, str]] = {
 class Repository(Protocol):
     def put_meeting(self, m: Meeting) -> None: ...
     def get_meeting(self, meeting_id: str) -> Meeting | None: ...
+    def update_schedule(self, meeting_id: str, weekday: int, time: str, default_minutes: int) -> bool: ...
     def delete_meeting(self, meeting_id: str) -> None: ...
     def meetings_in_channel(self, channel_id: str) -> list[Meeting]: ...
     def put_fixed(self, f: FixedItem) -> None: ...
@@ -91,6 +92,15 @@ class MemoryRepository:
     def get_meeting(self, meeting_id: str) -> Meeting | None:
         v = self.t["meetings"].get((meeting_id, ""))
         return _build(Meeting, v) if v else None
+
+    def update_schedule(self, meeting_id: str, weekday: int, time: str, default_minutes: int) -> bool:
+        """会議の曜日・時刻・長さだけを書き換える（settled_through など他の項目はそのまま）. 会議が無ければ False."""
+        with self._lock:
+            v = self.t["meetings"].get((meeting_id, ""))
+            if v is None:
+                return False
+            v.update(weekday=weekday, time=time, default_minutes=default_minutes)
+            return True
 
     def delete_meeting(self, meeting_id: str) -> None:
         """会議と、その固定の議題・議題・Canvas の記録を消す."""
@@ -184,6 +194,27 @@ class DynamoRepository:
     def get_meeting(self, meeting_id: str) -> Meeting | None:
         v = self.tables["meetings"].get_item(Key={"meeting_id": meeting_id}).get("Item")
         return _build(Meeting, v) if v else None
+
+    def update_schedule(self, meeting_id: str, weekday: int, time: str, default_minutes: int) -> bool:
+        """会議の曜日・時刻・長さだけを書き換える（UpdateItem. settled_through など他の項目は書き換えない）.
+
+        会議が無ければ（削除された後なら）書かずに False（put_item のように消えた会議を作り直さない）。
+        """
+        from botocore.exceptions import ClientError
+
+        try:
+            self.tables["meetings"].update_item(
+                Key={"meeting_id": meeting_id},
+                UpdateExpression="SET weekday = :w, #t = :t, default_minutes = :m",
+                ConditionExpression="attribute_exists(meeting_id)",
+                ExpressionAttributeNames={"#t": "time"},  # time は DynamoDB の予約語
+                ExpressionAttributeValues={":w": weekday, ":t": time, ":m": default_minutes},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
 
     def delete_meeting(self, meeting_id: str) -> None:
         """会議と、その固定の議題・議題・Canvas の記録を消す. 子の記録を先に消し、会議は最後に消す（途中で止まっても、もう一度消せる）."""

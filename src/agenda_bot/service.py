@@ -10,7 +10,17 @@ from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 
 from . import clock
-from .model import CanvasRecord, DraftItem, FixedItem, Meeting, accepted_expiry, agenda_markdown, build_agenda, new_id
+from .model import (
+    CanvasRecord,
+    DraftItem,
+    FixedItem,
+    Meeting,
+    accepted_expiry,
+    agenda_markdown,
+    build_agenda,
+    is_user_id,
+    new_id,
+)
 from .repository import Repository
 
 
@@ -123,6 +133,44 @@ def fill_warning(repo: Repository, meeting: Meeting) -> str:
     )
 
 
+def unfit_drafts(repo: Repository, meeting: Meeting) -> list[DraftItem]:
+    """会議時間に収まらない（固定の議題を除いた使える時間より長い）まま残っている議題. 出した順.
+
+    議題を出すときは長さを確かめているが、後から会議を短くしたり固定の議題を足したりすると収まらなくなり、
+    確定のたびに次の開催日へ繰り越され続ける（拒否はせず、警告とアジェンダの表示で知らせる）。
+    確定・中止を済ませた開催日より後の議題（今後の開催日のものも含む）を見る。
+    """
+    room = available_minutes(repo, meeting)
+    pending = repo.drafts_before(meeting.meeting_id, FAR_FUTURE, meeting.settled_through)
+    return sorted((d for d in pending if d.minutes > room), key=lambda d: (d.carried_from or d.meeting_date, d.created_at))
+
+
+MAX_UNFIT_LISTED = 10  # 警告に名前を並べる議題の数（多ければ「ほか N 件」）
+
+
+def unfit_warning(repo: Repository, meeting: Meeting) -> str:
+    """会議時間に収まらない議題があれば、その警告文（出した人へのメンション付き）. 無ければ空."""
+    items = unfit_drafts(repo, meeting)
+    if not items:
+        return ""
+    room = available_minutes(repo, meeting)
+    names = []
+    for d in items[:MAX_UNFIT_LISTED]:
+        who = f" <@{d.created_by}>" if is_user_id(d.created_by) else ""
+        names.append(f"「{_plain(d.title)}」（{d.minutes} 分{who}）")
+    more = f" ほか {len(items) - MAX_UNFIT_LISTED} 件" if len(items) > MAX_UNFIT_LISTED else ""
+    return (
+        f"議題に使える時間（{room} 分 = 会議 {meeting.default_minutes} 分 − 固定の議題 {meeting.default_minutes - room} 分）に"
+        f"収まりません: {'、'.join(names)}{more}。このままでは毎回次回へ繰り越されます。"
+        "時間を短くして出し直すか取り下げてもらうか、会議時間・固定の議題を見直してください。"
+    )
+
+
+def _plain(text: str) -> str:
+    """Slack の mrkdwn に入れる利用者の文字列（views.esc と同じ規則. service は views に依存しないのでここに置く）."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def add_fixed(
     repo: Repository, meeting_id: str, title: str, minutes: str | int, presenter: str = "", order: int | None = None
 ) -> FixedItem:
@@ -218,6 +266,8 @@ def update_meeting(
     """
     if not can_edit_meeting(meeting, user, admins):
         raise ValidationError("minutes", "会議を変更できるのは、会議の登録者と担当者（AGENDA_ADMINS）だけです")
+    if repo.get_meeting(meeting.meeting_id) is None:
+        raise ValidationError("minutes", "その会議は見つかりません（削除されたかもしれません）")
     new = replace(meeting, weekday=_weekday(weekday), time=_time(time), default_minutes=_minutes(minutes, "minutes"))
     old_next = meeting.next_date(now)
     pending = repo.drafts_before(meeting.meeting_id, FAR_FUTURE, meeting.settled_through)
@@ -236,8 +286,10 @@ def update_meeting(
             repo.put_draft(nd)  # 先に書いてから元を消す（途中で止まっても、議題は消えない）
             repo.delete_draft(meeting.meeting_id, d.meeting_date, d.item_id)
             moved.append(nd)
-    repo.put_meeting(new)
-    return new, moved
+    # 曜日・時刻・長さだけを書き換える（全体を上書きすると、画面を開いた後に別の人が確定した settled_through を戻してしまう）
+    if not repo.update_schedule(meeting.meeting_id, new.weekday, new.time, new.default_minutes):
+        raise ValidationError("minutes", "その会議は見つかりません（削除されたかもしれません）")
+    return repo.get_meeting(meeting.meeting_id) or new, moved
 
 
 def delete_meeting(repo: Repository, meeting: Meeting, user: str, admins: Iterable[str] = ()) -> None:
@@ -257,6 +309,8 @@ class AgendaView:
     markdown: str
     # 確定も中止もされていない過去の開催日（古い順）. 担当者が「確定」か「中止」を選ぶまで、保存した状態は変えない
     unsettled: list[str] = field(default_factory=list)
+    # 次回へ回した議題のうち、会議時間（固定の議題を除く）より長く、何度繰り越しても収まらない議題
+    unfit: list[DraftItem] = field(default_factory=list)
 
 
 def _project(repo: Repository, meeting: Meeting, day: date) -> tuple[list[DraftItem], list[str]]:
@@ -351,10 +405,11 @@ def agenda(repo: Repository, meeting: Meeting, today: date | datetime) -> Agenda
     """
     day = meeting.next_date(today)
     carried, unsettled = _project(repo, meeting, day)
-    rows, total, deferred = build_agenda(
-        meeting, day, repo.fixed_items(meeting.meeting_id), repo.drafts(meeting.meeting_id, day.isoformat()) + carried
-    )
-    return AgendaView(meeting, day, rows, total, deferred, agenda_markdown(meeting, day, rows, total, deferred), unsettled)
+    fixed = repo.fixed_items(meeting.meeting_id)
+    rows, total, deferred = build_agenda(meeting, day, fixed, repo.drafts(meeting.meeting_id, day.isoformat()) + carried)
+    room = max(meeting.default_minutes - sum(f.minutes for f in fixed), 0)
+    unfit = [d for d in deferred if d.minutes > room]
+    return AgendaView(meeting, day, rows, total, deferred, agenda_markdown(meeting, day, rows, total, deferred), unsettled, unfit)
 
 
 class CanvasApi(Protocol):

@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 dependencies = ["slack_bolt>=1.18", "boto3>=1.34", "tzdata; sys_platform == 'win32'"]  # Windows はタイムゾーンのデータを持たないため tzdata
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "moto[dynamodb]>=5.0", "mypy>=1.11"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "moto[dynamodb]>=5.0", "mypy>=1.11"]
 
 [project.scripts]
 agenda-bot = "agenda_bot.app:main"
@@ -42,3 +42,12 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["agenda_bot"]
+
+[tool.coverage.report]
+# CI（pytest --cov）でこれを下回ると落とす. 今は約 93%
+fail_under = 90
+show_missing = true
+skip_covered = true

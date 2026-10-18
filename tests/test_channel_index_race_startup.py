@@ -223,3 +223,25 @@ def test_legacy_meeting_without_version_attribute(aws):
     assert service.add_draft(repo, m, TODAY, "議題", "", 10, "", "UA").meeting_date == "2026-10-05"
     new, moved = service.update_meeting(repo, m, OWNER, "1", "10:00", "60", TODAY)
     assert new.schedule_version == 1 and [x.meeting_date for x in moved] == ["2026-10-06"]
+
+
+def test_put_draft_without_condition_check_permission_falls_back(aws, monkeypatch, caplog):
+    """この版より前の IAM ロール（ConditionCheckItem が無い）でも議題を出せる（警告して、会議を読んで確かめてから書く）."""
+    from botocore.exceptions import ClientError
+
+    from agenda_bot.repository import DynamoRepository, create_tables
+
+    create_tables(aws)
+    repo = DynamoRepository(resource=aws)
+    m = service.register_meeting(repo, "C1", OWNER, "定例", 0, "10:00", 60)
+
+    def denied(**kw):
+        raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "TransactWriteItems")
+
+    monkeypatch.setattr(aws.meta.client, "transact_write_items", denied)
+    with caplog.at_level(logging.WARNING, logger="agenda_bot"):
+        d = service.add_draft(repo, m, TODAY, "議題", "", 10, "", "UA")
+    assert [x.title for x in repo.drafts(m.meeting_id, d.meeting_date)] == ["議題"]
+    assert "ConditionCheckItem" in caplog.text
+    service.update_meeting(repo, m, OWNER, "1", "10:00", "60", TODAY)
+    assert service.add_draft(repo, m, TODAY, "古い会議で", "", 10, "", "UA").meeting_date == "2026-10-06"  # 版の確認は効く

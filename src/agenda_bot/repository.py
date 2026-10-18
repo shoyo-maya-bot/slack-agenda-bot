@@ -198,6 +198,7 @@ class DynamoRepository:
         self.prefix = prefix
         self.tables = {k: resource.Table(prefix + k) for k in TABLES}
         self._channel_index: bool | None = None  # GSI channel_id-index があるか（None はまだ確かめていない）
+        self._warned_no_transaction = False
 
     def check_tables(self) -> list[str]:
         """起動時の確認. テーブルが無ければ MissingTablesError. → 警告（GSI・TTL が無いなど. 動くが直したほうがよいもの）.
@@ -369,12 +370,29 @@ class DynamoRepository:
                 ]
             )
         except ClientError as e:
-            if e.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+            code = e.response.get("Error", {}).get("Code")
+            if code == "AccessDeniedException":
+                return self._put_draft_without_transaction(d, schedule_version)
+            if code != "TransactionCanceledException":
                 raise
             reasons = [r.get("Code") for r in e.response.get("CancellationReasons") or []]
             if reasons and reasons[0] == "ConditionalCheckFailed":
                 return False
             raise
+        return True
+
+    def _put_draft_without_transaction(self, d: DraftItem, schedule_version: int) -> bool:
+        """dynamodb:ConditionCheckItem の権限が無い環境向け（この版より前の IAM ロール）. 会議を読んで確かめてから書く（1 回の操作ではない）."""
+        if not self._warned_no_transaction:
+            self._warned_no_transaction = True
+            log.warning(
+                "dynamodb:ConditionCheckItem の権限が無いので、議題を条件付きで書けません（会議の変更と同時に出た議題が古い開催日に残ることがあります）。"
+                "ボットのロールに権限を足してください（docs/setup.md）"
+            )
+        v = self.tables["meetings"].get_item(Key={"meeting_id": d.meeting_id}, ConsistentRead=True).get("Item")
+        if v is None or int(v.get("schedule_version", 0)) != schedule_version:
+            return False
+        self.put_draft(d)
         return True
 
     def delete_draft(self, meeting_id: str, meeting_date: str, item_id: str) -> None:

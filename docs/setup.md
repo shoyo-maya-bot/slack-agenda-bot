@@ -70,7 +70,7 @@ python scripts/create_tables.py          # .env の DYNAMODB_ENDPOINT（http://l
 |---|---|
 | `dynamodb:GetItem`・`PutItem`・`UpdateItem`・`DeleteItem`・`Query`・`BatchWriteItem` | 4 つのテーブル（`agenda_*`）の読み書き |
 | `dynamodb:Query` を `agenda_meetings/index/channel_id-index` に | `/agenda` のチャンネルの会議の一覧 |
-| `dynamodb:ConditionCheckItem`（`agenda_meetings`） | 議題を出すとき、会議の予定が変わっていないかの確認（TransactWriteItems） |
+| `dynamodb:ConditionCheckItem`（`agenda_meetings`） | 議題を出すとき、会議の予定が変わっていないかの確認（TransactWriteItems）。無ければ警告して、会議を読んで確かめてから書く（会議の変更との競合は防ぎきれない） |
 | `dynamodb:Scan`（`agenda_meetings`） | GSI の無い古いテーブルのときだけ（GSI を足したら外してよい） |
 | `dynamodb:DescribeTable`（任意） | 起動時にテーブルがあるかの確認。無ければ確かめずに起動する |
 

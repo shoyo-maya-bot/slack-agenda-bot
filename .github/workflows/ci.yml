@@ -23,7 +23,8 @@ jobs:
       - run: ruff check . && ruff format --check .
       - name: type check (mypy)
         run: mypy
-      - run: pytest -q -rs   # moto（DynamoDB の模擬）と slack_bolt のテストも実行される
+      # moto（DynamoDB の模擬）と slack_bolt のテストも実行される. カバレッジが下限（pyproject.toml の fail_under）を下回ると落ちる
+      - run: pytest -q -rs --cov
 
   test-windows:
     runs-on: windows-latest
@@ -90,8 +91,13 @@ jobs:
           from agenda_bot import service
           from agenda_bot.repository import DynamoRepository
           repo = DynamoRepository(endpoint_url="http://localhost:8000")
+          assert repo.check_tables() == [], repo.check_tables()  # 起動時の確認（テーブル・GSI）
           m = service.register_meeting(repo, "C1", "UO", "定例", 0, "10:00", 30)
-          service.add_draft(repo, m, date(2026, 10, 2), "議題", "", 10, "", "UA")
+          assert [x.meeting_id for x in repo.meetings_in_channel("C1")] == [m.meeting_id]  # GSI の Query
+          service.add_draft(repo, m, date(2026, 10, 2), "議題", "", 10, "", "UA")  # TransactWriteItems
+          # 会議の版が違えば議題を書かない（会議の変更との競合を防ぐ条件付きの書き込み）
+          from agenda_bot.model import DraftItem
+          assert repo.put_draft_if_schedule(DraftItem(m.meeting_id, "2026-10-05", "x", "t", "", 5, "UA", "UA"), 99) is False
           v = service.agenda(repo, m, date(2026, 10, 2))
           assert [r["title"] for r in v.rows] == ["議題"], v.rows
           # 条件付き put（Canvas の重複防止）と繰り越しのクエリも DynamoDB Local で確かめる

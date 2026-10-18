@@ -199,12 +199,30 @@ def remove_fixed(repo: Repository, meeting_id: str, item_id: str) -> FixedItem:
 def add_draft(
     repo: Repository, meeting: Meeting, today: date | datetime, title: str, detail: str, minutes: str | int, presenter: str, user: str
 ) -> DraftItem:
-    """議題を次の開催日に出す. today に日時（clock.now()）を渡すと、今日の会議が終わった後なら翌週に出す."""
+    """議題を次の開催日に出す. today に日時（clock.now()）を渡すと、今日の会議が終わった後なら翌週に出す.
+
+    会議の予定（曜日・時刻・長さ）が読んだときのままのときだけ書く（put_draft_if_schedule）。同時に会議が変更されたら、
+    新しい予定で 1 回だけ出し直す（古い開催日に議題が残って、付け替えから漏れないように）。会議が削除されていたら出さない。
+    """
     title = _title(title)
     detail = (detail or "").strip()
     if len(detail) > MAX_DETAIL:
         raise ValidationError("detail", f"補足は {MAX_DETAIL} 文字以内で入れてください（今は {len(detail)} 文字）")
     n = _minutes(minutes, "minutes")
+    for _ in range(2):
+        d = _new_draft(repo, meeting, today, title, detail, n, presenter, user)
+        if repo.put_draft_if_schedule(d, meeting.schedule_version):
+            return d
+        fresh = repo.get_meeting(meeting.meeting_id)
+        if fresh is None:
+            raise ValidationError("title", "その会議は見つかりません（削除されたかもしれません）")
+        meeting = fresh
+    raise ValidationError("minutes", "ちょうど会議の予定が変更されたところです。もう一度出してください")
+
+
+def _new_draft(
+    repo: Repository, meeting: Meeting, today: date | datetime, title: str, detail: str, n: int, presenter: str, user: str
+) -> DraftItem:
     room = available_minutes(repo, meeting)
     if room <= 0:
         raise ValidationError(
@@ -217,7 +235,7 @@ def add_draft(
             "minutes",
             f"議題に使える時間は {room} 分までです（会議 {meeting.default_minutes} 分 − 固定の議題 {meeting.default_minutes - room} 分）",
         )
-    d = DraftItem(
+    return DraftItem(
         meeting.meeting_id,
         meeting.next_date(today).isoformat(),
         new_id(),
@@ -227,8 +245,6 @@ def add_draft(
         presenter or user,
         user,
     )
-    repo.put_draft(d)
-    return d
 
 
 def remove_draft(repo: Repository, meeting: Meeting, meeting_date: str, item_id: str, user: str, admins: Iterable[str] = ()) -> None:
@@ -263,33 +279,42 @@ def update_meeting(
 
     次の開催日やその後に出ている議題は、新しい曜日・時刻の開催日へ付け替える（同じ週数だけ先の開催日へ）。
     確定も中止もされていない過去の会議があるときは、先にそちらを決めてもらう（どの曜日の会議として扱うか曖昧になるため）。
+
+    同時に出される議題（add_draft）と競合しないよう、先に予定を書き換えて schedule_version を上げ（条件付き）、その後で
+    議題を強い整合性で読み直して付け替える。版が上がった後に古い予定で出そうとした議題は、add_draft が新しい予定で出し直す。
+    同時にほかの人が会議を変更していたら（版が違えば）書かずに断る。
     """
     if not can_edit_meeting(meeting, user, admins):
         raise ValidationError("minutes", "会議を変更できるのは、会議の登録者と担当者（AGENDA_ADMINS）だけです")
-    if repo.get_meeting(meeting.meeting_id) is None:
+    current = repo.get_meeting(meeting.meeting_id)
+    if current is None:
         raise ValidationError("minutes", "その会議は見つかりません（削除されたかもしれません）")
-    new = replace(meeting, weekday=_weekday(weekday), time=_time(time), default_minutes=_minutes(minutes, "minutes"))
-    old_next = meeting.next_date(now)
-    pending = repo.drafts_before(meeting.meeting_id, FAR_FUTURE, meeting.settled_through)
+    new = replace(current, weekday=_weekday(weekday), time=_time(time), default_minutes=_minutes(minutes, "minutes"))
+    old_next = current.next_date(now)
+    pending = repo.drafts_before(current.meeting_id, FAR_FUTURE, current.settled_through)
     past = sorted({d.meeting_date for d in pending if d.meeting_date < old_next.isoformat()})
     if past:
         raise ValidationError("minutes", f"先に {past[0]} の会議を確定か中止にしてください（「次回のアジェンダ」から選べます）")
     new_next = new.next_date(now)
+    # 曜日・時刻・長さだけを書き換える（全体を上書きすると、画面を開いた後に別の人が確定した settled_through を戻してしまう）
+    if not repo.update_schedule(current.meeting_id, new.weekday, new.time, new.default_minutes, expected_version=current.schedule_version):
+        if repo.get_meeting(current.meeting_id) is None:
+            raise ValidationError("minutes", "その会議は見つかりません（削除されたかもしれません）")
+        raise ValidationError("minutes", "同時にほかの人が会議を変更しました。開き直してからもう一度変更してください")
     moved: list[DraftItem] = []
     if new_next != old_next:
-        for d in pending:
+        for d in repo.drafts_before(current.meeting_id, FAR_FUTURE, current.settled_through, consistent=True):
+            if d.meeting_date < old_next.isoformat():
+                continue  # 確認の後に過去の開催日へ書かれることはないが、念のため付け替えない
             shift = date.fromisoformat(d.meeting_date) - old_next
             target = (new_next + shift).isoformat()
             if target == d.meeting_date:
                 continue
             nd = replace(d, meeting_date=target)
             repo.put_draft(nd)  # 先に書いてから元を消す（途中で止まっても、議題は消えない）
-            repo.delete_draft(meeting.meeting_id, d.meeting_date, d.item_id)
+            repo.delete_draft(current.meeting_id, d.meeting_date, d.item_id)
             moved.append(nd)
-    # 曜日・時刻・長さだけを書き換える（全体を上書きすると、画面を開いた後に別の人が確定した settled_through を戻してしまう）
-    if not repo.update_schedule(meeting.meeting_id, new.weekday, new.time, new.default_minutes):
-        raise ValidationError("minutes", "その会議は見つかりません（削除されたかもしれません）")
-    return repo.get_meeting(meeting.meeting_id) or new, moved
+    return repo.get_meeting(current.meeting_id) or new, moved
 
 
 def delete_meeting(repo: Repository, meeting: Meeting, user: str, admins: Iterable[str] = ()) -> None:

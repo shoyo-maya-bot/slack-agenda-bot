@@ -18,6 +18,8 @@ charset-normalizer==3.5.2
     # via requests
 colorama==0.4.6 ; sys_platform == 'win32'
     # via pytest
+coverage==7.16.2
+    # via pytest-cov
 cryptography==50.0.2
     # via moto
 docker==7.2.0
@@ -45,7 +47,9 @@ packaging==26.3
 pathspec==1.1.1
     # via mypy
 pluggy==1.6.0
-    # via pytest
+    # via
+    #   pytest
+    #   pytest-cov
 py-partiql-parser==0.6.3
     # via moto
 pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
@@ -53,6 +57,10 @@ pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementatio
 pygments==2.21.0
     # via pytest
 pytest==9.1.1
+    # via
+    #   slack-agenda-bot (pyproject.toml)
+    #   pytest-cov
+pytest-cov==7.1.0
     # via slack-agenda-bot (pyproject.toml)
 python-dateutil==2.9.0.post0
     # via botocore

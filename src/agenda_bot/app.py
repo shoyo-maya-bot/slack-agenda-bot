@@ -18,7 +18,7 @@ from pathlib import Path
 from . import clock, service, views
 from .model import USER_ID as _USER_ID
 from .model import Meeting
-from .repository import DynamoRepository, Repository
+from .repository import DynamoRepository, MissingTablesError, Repository
 
 log = logging.getLogger("agenda_bot")
 
@@ -413,7 +413,8 @@ class Handlers:
         respond(
             response_type="ephemeral",
             replace_original=True,
-            blocks=views.menu(self.repo.meetings_in_channel(m.channel_id)),
+            # GSI は結果整合なので、消した直後の一覧に残っていることがある. 消した会議は除いて出す
+            blocks=views.menu([x for x in self.repo.meetings_in_channel(m.channel_id) if x.meeting_id != m.meeting_id]),
             text="会議を削除しました",
         )
         client.chat_postMessage(channel=m.channel_id, text=f"<@{body['user']['id']}> さんが会議「{views.esc(m.name)}」を削除しました。")
@@ -550,6 +551,23 @@ def use_local_dynamodb() -> bool:
     return True
 
 
+def check_storage(repo: DynamoRepository) -> None:
+    """起動時にテーブルがあるか確かめる. 無ければ（作り忘れ・TABLE_PREFIX の誤り）、最初の /agenda で落ちる前にここで止める.
+
+    DynamoDB に届かない（DynamoDB Local が起動していない・認証情報が無い）ときも、理由を出して止める。
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        warnings = repo.check_tables()
+    except MissingTablesError as e:
+        sys.exit(f"設定の誤り: {e}")
+    except (BotoCoreError, ClientError) as e:
+        sys.exit(f"DynamoDB に接続できません: {e}（DYNAMODB_ENDPOINT・AWS_REGION・AWS の認証情報を確かめてください）")
+    for w in warnings:
+        log.warning(w)
+
+
 def main() -> None:
     load_env()
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -577,5 +595,6 @@ def main() -> None:
         endpoint_url=os.environ.get("DYNAMODB_ENDPOINT") or None,
         region=os.environ.get("AWS_REGION", "ap-northeast-1"),
     )
+    check_storage(repo)
     app = build_app(repo, token=bot_token, canvas_mode=mode, admins=admins, tz=tz.key, error_channel=error_channel)
     SocketModeHandler(app, app_token).start()

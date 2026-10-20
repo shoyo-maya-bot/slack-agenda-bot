@@ -59,6 +59,8 @@ class Meeting:
     default_minutes: int = 60
     # 確定か中止を済ませた最後の開催日（YYYY-MM-DD）. これ以前の議題は扱い済みなので、繰り越しを探すときに読まない
     settled_through: str = ""
+    # 曜日・時刻・長さを変えるたびに 1 増える. 議題を出すときに、読んだ会議の予定のままか（途中で変わっていないか）を確かめる
+    schedule_version: int = 0
 
     def start_time(self) -> Time:
         return Time(int(self.time[:2]), int(self.time[3:5]))

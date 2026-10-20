@@ -64,14 +64,43 @@ python scripts/create_tables.py          # .env の DYNAMODB_ENDPOINT（http://l
 1. `.env` の `DYNAMODB_ENDPOINT` を空にし、AWS の認証情報は IAM ロール（ECS のタスクロールなど）か AWS CLI のプロファイル（`AWS_PROFILE`）を使う。
    アクセスキーを `.env` に書かない（DynamoDB Local のときは、ボットがダミーの値を自動で使う）
 2. `python scripts/create_tables.py --aws`（オンデマンド課金のテーブルを作る）
-3. ボットを動かす場所（ECS・EC2 など）に、4 つのテーブルの読み書き権限だけを付ける
+3. ボットを動かす場所（ECS・EC2 など）に、4 つのテーブルの読み書き権限だけを付ける（下の表）
+
+| 権限 | 使うところ |
+|---|---|
+| `dynamodb:GetItem`・`PutItem`・`UpdateItem`・`DeleteItem`・`Query`・`BatchWriteItem` | 4 つのテーブル（`agenda_*`）の読み書き |
+| `dynamodb:Query` を `agenda_meetings/index/channel_id-index` に | `/agenda` のチャンネルの会議の一覧 |
+| `dynamodb:ConditionCheckItem`（`agenda_meetings`） | 議題を出すとき、会議の予定が変わっていないかの確認（TransactWriteItems）。無ければ警告して、会議を読んで確かめてから書く（会議の変更との競合は防ぎきれない） |
+| `dynamodb:Scan`（`agenda_meetings`） | GSI の無い古いテーブルのときだけ（GSI を足したら外してよい） |
+| `dynamodb:DescribeTable`（任意） | 起動時にテーブルがあるかの確認。無ければ確かめずに起動する |
+
+`scripts/create_tables.py` を実行する人（ボットではない）には、加えて `CreateTable`・`UpdateTable`・`DescribeTable`・
+`DescribeTimeToLive`・`UpdateTimeToLive` が要ります。
+
+ボットは起動時にテーブルがあるか確かめ、無ければ（作り忘れ・`TABLE_PREFIX` や `AWS_REGION` の誤り）理由を出して止まります。
 
 | テーブル | キー | 中身 |
 |---|---|---|
-| `agenda_meetings` | meeting_id | 会議（チャンネル・曜日・時刻・時間・担当者） |
+| `agenda_meetings` | meeting_id（GSI `channel_id-index`: channel_id） | 会議（チャンネル・曜日・時刻・時間・担当者・予定の版 `schedule_version`） |
 | `agenda_fixed_items` | meeting_id + item_id | 固定の議題 |
 | `agenda_drafts` | meeting_id + sk（開催日#item_id） | 出された議題（status: proposed / accepted＝扱い済み / deferred＝繰り越し）。TTL 属性 `expires_at` |
 | `agenda_canvases` | meeting_id + meeting_date | 開催日ごとの Canvas の ID（空は作成中） |
+
+### チャンネルの会議の一覧（GSI）
+
+`/agenda` は、`agenda_meetings` の GSI `channel_id-index` を Query して、そのチャンネルの会議だけを読みます（テーブル全体を Scan しない）。
+
+- この版より前に作ったテーブルには GSI がありません。**`python scripts/create_tables.py --aws` をもう一度実行すると GSI だけ足します**
+  （既存の会議を GSI に写す間、数分は「作成中」です）。GSI が無い・作成中の間、ボットは警告を出して従来どおり Scan します。
+  作成が終わったらボットを起動し直すと GSI を使います
+- GSI は結果整合なので、会議を登録した直後（1 秒未満）は `/agenda` の一覧に出ないことがあります
+
+### 会議の変更と議題の追加が重なったとき
+
+会議には予定の版（`schedule_version`。曜日・時刻・長さを変えるたびに 1 増える）があり、議題は「会議を読んだときの版のまま」のときだけ書きます
+（会議の条件確認と議題の書き込みを TransactWriteItems で 1 回に）。会議の変更と同時に出された議題は、新しい予定の開催日に出し直すので、
+古い開催日に残って付け替えから漏れることはありません。同時に 2 人が会議を変更したときは、後の人に「開き直してください」と返します。
+この版より前に作った会議（`schedule_version` が無い）は版 0 として扱うので、データの移行は要りません。
 
 ### 扱い済みの議題の後片付け（TTL）
 

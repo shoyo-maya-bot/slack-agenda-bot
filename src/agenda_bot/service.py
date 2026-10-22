@@ -34,6 +34,7 @@ class ValidationError(ValueError):
 
 MAX_TITLE = 100  # 議題・会議名の長さの上限（文字）
 MAX_DETAIL = 2000  # 補足の長さの上限（文字）
+MIN_MINUTES, MAX_MINUTES = 1, 240  # 議題・固定の議題・会議の時間（分）の範囲
 PENDING = ""  # Canvas を作っている途中（canvases に ID の代わりに入れる）
 PENDING_TIMEOUT = timedelta(minutes=5)  # 作成中の印がこれより古ければ、作成が途中で止まったとみなして作り直す
 SAVE_BACKOFF = 0.5  # Canvas の ID の保存をやり直すまでの秒（回数に比例して延ばす）
@@ -59,8 +60,8 @@ def _minutes(value: str | int, field: str) -> int:
         n = int(value)
     except (TypeError, ValueError):
         raise ValidationError(field, "分を数字で入れてください") from None
-    if not 1 <= n <= 240:
-        raise ValidationError(field, "1〜240 分で入れてください")
+    if not MIN_MINUTES <= n <= MAX_MINUTES:
+        raise ValidationError(field, f"{MIN_MINUTES}〜{MAX_MINUTES} 分で入れてください")
     return n
 
 
@@ -104,7 +105,7 @@ def can_manage(meeting: Meeting | None, user: str, admins: Iterable[str] = ()) -
 
 
 def can_edit_meeting(meeting: Meeting, user: str, admins: Iterable[str] = ()) -> bool:
-    """会議の変更（曜日・時刻・長さ）と削除ができるか. 会議の登録者と AGENDA_ADMINS の担当者."""
+    """会議の変更（曜日・時刻・長さ）・登録者の引き継ぎ・削除ができるか. 会議の登録者と AGENDA_ADMINS の担当者."""
     return user == meeting.owner or user in frozenset(admins)
 
 
@@ -217,7 +218,7 @@ def add_draft(
         if fresh is None:
             raise ValidationError("title", "その会議は見つかりません（削除されたかもしれません）")
         meeting = fresh
-    raise ValidationError("minutes", "ちょうど会議の予定が変更されたところです。もう一度出してください")
+    raise ValidationError("minutes", "ちょうど会議の予定が変更（または会議が削除）されたところです。もう一度出してください")
 
 
 def _new_draft(
@@ -315,6 +316,30 @@ def update_meeting(
             repo.delete_draft(current.meeting_id, d.meeting_date, d.item_id)
             moved.append(nd)
     return repo.get_meeting(current.meeting_id) or new, moved
+
+
+def transfer_meeting(repo: Repository, meeting: Meeting, user: str, new_owner: str, admins: Iterable[str] = ()) -> Meeting:
+    """会議の登録者（owner）を new_owner に引き継ぐ（登録者と AGENDA_ADMINS の担当者だけ）. → 引き継いだ後の会議.
+
+    AGENDA_ADMINS が空のとき、確定・中止・Canvas への出力・固定の議題は登録者だけができるので、登録者が異動・退職すると
+    誰も確定できず、会議の変更も「先に確定」で止まる。登録者が抜ける前に引き継ぐか、AGENDA_ADMINS の担当者が代わりに引き継ぐ。
+    今の登録者が読んだときのままのときだけ書く（同時に別の人が引き継いだら断る）。
+    """
+    current = repo.get_meeting(meeting.meeting_id)
+    if current is None:
+        raise ValidationError("owner", "その会議は見つかりません（削除されたかもしれません）")
+    if not can_edit_meeting(current, user, admins):
+        raise ValidationError("owner", "登録者を引き継げるのは、会議の登録者と担当者（AGENDA_ADMINS）だけです")
+    new_owner = (new_owner or "").strip()
+    if not is_user_id(new_owner):
+        raise ValidationError("owner", "引き継ぐ人を選んでください")
+    if new_owner == current.owner:
+        return current
+    if not repo.update_owner(current.meeting_id, new_owner, expected_owner=current.owner):
+        if repo.get_meeting(current.meeting_id) is None:
+            raise ValidationError("owner", "その会議は見つかりません（削除されたかもしれません）")
+        raise ValidationError("owner", "同時にほかの人が登録者を変更しました。開き直してからもう一度変更してください")
+    return repo.get_meeting(current.meeting_id) or replace(current, owner=new_owner)
 
 
 def delete_meeting(repo: Repository, meeting: Meeting, user: str, admins: Iterable[str] = ()) -> None:
@@ -530,7 +555,7 @@ def publish_canvas(
     """アジェンダを Canvas に書く. 同じ開催日の Canvas があれば中身を置き換える. → (Canvas の ID, 新しく作ったか).
 
     mode=standalone: 開催日ごとに Canvas を作り、チャンネルに編集権限を付ける（有料プラン向け）
-    mode=channel: チャンネルの Canvas（1 チャンネルに 1 つ）を毎回置き換える（無料プランでも使える）
+    mode=channel: チャンネルの Canvas（1 チャンネルに 1 つ）を毎回置き換える（API で作るので有料プランが必要. docs/setup.md）
 
     重複を防ぐため、作る前に「作成中」の印を条件付きで書き（先に書けた 1 人だけが作る）、作った直後に ID を保存してから権限を付ける。
     権限の付与に失敗しても ID は残るので、もう一度押すと同じ Canvas を更新し、権限を付け直す。

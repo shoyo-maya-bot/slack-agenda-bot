@@ -13,12 +13,23 @@
 
 ### 操作できる人（AGENDA_ADMINS）
 
-| AGENDA_ADMINS | 会議の登録 | 固定の議題の追加と削除・Canvas への出力・過去の会議の確定と中止 | 会議の変更（曜日・時刻・長さ）と削除 | 議題の取り下げ | 議題を出す・見る |
+| AGENDA_ADMINS | 会議の登録 | 固定の議題の追加と削除・Canvas への出力・過去の会議の確定と中止 | 会議の変更（曜日・時刻・長さ・登録者の引き継ぎ）と削除 | 議題の取り下げ | 議題を出す・見る |
 |---|---|---|---|---|---|
 | 空（既定） | 誰でもできる | **その会議の登録者だけ** | その会議の登録者 | 出した人・会議の登録者 | 誰でもできる |
 | `U0123ABCD,U0456EFGH` | 書いたユーザーだけ | 書いたユーザーだけ | 会議の登録者と書いたユーザー | 出した人・会議の登録者・書いたユーザー | 誰でもできる |
 
 ユーザー ID は Slack のプロフィールの「︙ → メンバー ID をコピー」で分かります。ID の形でない値は警告を出して使わず、1 つも使えなければ起動時に止まります。
+
+#### 登録者がいなくなった会議（管理者による引き継ぎ）
+
+`AGENDA_ADMINS` が空で、会議の登録者が異動・退職などでいなくなると、その会議の確定・中止・Canvas への出力・固定の議題は誰もできません。
+次の手順で、別の人に登録者を引き継ぎます。
+
+1. `.env` の `AGENDA_ADMINS` に、引き継ぎをする人のユーザー ID を書いてボットを起動し直す
+2. その人が `/agenda` →「会議の変更」→「会議の登録者」で新しい登録者を選んで「変更」（曜日・時刻・長さはそのままでよい）
+3. 担当者を置かない運用に戻すなら、`AGENDA_ADMINS` を空に戻して起動し直す
+
+登録者がいるうちなら、登録者自身が 2 の操作で引き継げます（ボットの再起動は要りません）。
 
 ### Canvas とプラン
 
@@ -81,7 +92,7 @@ python scripts/create_tables.py          # .env の DYNAMODB_ENDPOINT（http://l
 
 | テーブル | キー | 中身 |
 |---|---|---|
-| `agenda_meetings` | meeting_id（GSI `channel_id-index`: channel_id） | 会議（チャンネル・曜日・時刻・時間・担当者・予定の版 `schedule_version`） |
+| `agenda_meetings` | meeting_id（GSI `channel_id-index`: channel_id） | 会議（チャンネル・曜日・時刻・時間・登録者 `owner`・予定の版 `schedule_version`・削除中の印 `deleting`） |
 | `agenda_fixed_items` | meeting_id + item_id | 固定の議題 |
 | `agenda_drafts` | meeting_id + sk（開催日#item_id） | 出された議題（status: proposed / accepted＝扱い済み / deferred＝繰り越し）。TTL 属性 `expires_at` |
 | `agenda_canvases` | meeting_id + meeting_date | 開催日ごとの Canvas の ID（空は作成中） |
@@ -101,6 +112,12 @@ python scripts/create_tables.py          # .env の DYNAMODB_ENDPOINT（http://l
 （会議の条件確認と議題の書き込みを TransactWriteItems で 1 回に）。会議の変更と同時に出された議題は、新しい予定の開催日に出し直すので、
 古い開催日に残って付け替えから漏れることはありません。同時に 2 人が会議を変更したときは、後の人に「開き直してください」と返します。
 この版より前に作った会議（`schedule_version` が無い）は版 0 として扱うので、データの移行は要りません。
+
+### 会議の削除と議題の追加が重なったとき
+
+会議を消すときは、先に会議に削除中の印（`deleting`）を付け、印の付いた会議には議題を書きません（上と同じ条件付きの書き込み）。
+その後で固定の議題・議題・Canvas の記録を消し、会議を消し、最後にもう一度それらを消します（削除の途中に書かれた固定の議題や繰り越しも残さない）。
+途中で止まっても、もう一度削除すれば残りを消します。削除と同時に出した人には「もう一度出してください」と返り、出し直すと「見つかりません」になります。
 
 ### 扱い済みの議題の後片付け（TTL）
 
@@ -184,7 +201,7 @@ sudo systemctl restart agenda-bot    # 更新（git pull と pip install の後�
 
 | ログ | 意味と対処 |
 |---|---|
-| `timezone: … / canvas mode: … / admins: … / error channel: …` | 起動時の設定。起動するたびに 1 回出る |
+| `timezone: … / canvas mode: … / admins: … / error channel: …` | 起動時の設定。起動するたびに 1 回出る（`admins` は `AGENDA_ADMINS` の人数。空なら「なし（確定・中止などは各会議の登録者）」） |
 | `ハンドラーで想定外のエラー（action:… など）` | 操作が失敗した（スタックトレース付き）。押した本人と、`ERROR_CHANNEL` があればそこにも知らせている |
 | `Canvas の ID の保存に失敗しました（n/3 回目）` | DynamoDB への書き込みが一時的に失敗した。続くなら権限・スロットリングを確認 |
 | `記録した Canvas … が見つかりません` | Slack 側で Canvas が消された。記録を消して作り直したので対処は不要 |

@@ -23,6 +23,7 @@ log = logging.getLogger("agenda_bot")
 
 TTL_ATTRIBUTE = "expires_at"  # drafts の TTL 属性（扱い済みの議題だけに入れる）
 CHANNEL_INDEX = "channel_id-index"  # meetings の GSI（パーティションキー channel_id、全項目を射影）
+DELETING_ATTRIBUTE = "deleting"  # 削除中の会議の印（DynamoRepository.delete_meeting が付ける. 付いた会議には議題を書かない）
 
 
 class MissingTablesError(RuntimeError):
@@ -43,6 +44,7 @@ class Repository(Protocol):
     def update_schedule(
         self, meeting_id: str, weekday: int, time: str, default_minutes: int, expected_version: int | None = None
     ) -> bool: ...
+    def update_owner(self, meeting_id: str, owner: str, expected_owner: str) -> bool: ...
     def delete_meeting(self, meeting_id: str) -> None: ...
     def meetings_in_channel(self, channel_id: str) -> list[Meeting]: ...
     def put_fixed(self, f: FixedItem) -> None: ...
@@ -114,8 +116,17 @@ class MemoryRepository:
             v.update(weekday=weekday, time=time, default_minutes=default_minutes, schedule_version=int(v.get("schedule_version", 0)) + 1)
             return True
 
+    def update_owner(self, meeting_id: str, owner: str, expected_owner: str) -> bool:
+        """会議の登録者（owner）だけを書き換える. 会議が無い・今の登録者が expected_owner でなければ書かずに False."""
+        with self._lock:
+            v = self.t["meetings"].get((meeting_id, ""))
+            if v is None or v.get("owner") != expected_owner:
+                return False
+            v["owner"] = owner
+            return True
+
     def delete_meeting(self, meeting_id: str) -> None:
-        """会議と、その固定の議題・議題・Canvas の記録を消す."""
+        """会議と、その固定の議題・議題・Canvas の記録を消す（1 回の操作. 議題の書き込み put_draft_if_schedule と同じロックの中）."""
         with self._lock:
             for table in TABLES:
                 for key in [k for k in self.t[table] if k[0] == meeting_id]:
@@ -288,14 +299,54 @@ class DynamoRepository:
             raise
         return True
 
+    def update_owner(self, meeting_id: str, owner: str, expected_owner: str) -> bool:
+        """会議の登録者（owner）だけを書き換える（UpdateItem. 今の登録者が expected_owner のときだけ）. 書けたら True."""
+        from botocore.exceptions import ClientError
+
+        try:
+            self.tables["meetings"].update_item(
+                Key={"meeting_id": meeting_id},
+                UpdateExpression="SET #o = :o",
+                ConditionExpression="attribute_exists(meeting_id) AND #o = :e",
+                ExpressionAttributeNames={"#o": "owner"},
+                ExpressionAttributeValues={":o": owner, ":e": expected_owner},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
+
     def delete_meeting(self, meeting_id: str) -> None:
-        """会議と、その固定の議題・議題・Canvas の記録を消す. 子の記録を先に消し、会議は最後に消す（途中で止まっても、もう一度消せる）."""
+        """会議と、その固定の議題・議題・Canvas の記録を消す（途中で止まっても、もう一度消せる）.
+
+        1. 会議に削除中の印（DELETING_ATTRIBUTE）を付ける. 印のある会議には議題を書かない（put_draft_if_schedule の条件）
+        2. 子の記録（固定の議題・議題・Canvas）を消す
+        3. 会議を消す
+        4. 子の記録をもう一度消す（1〜3 の間に条件なしで書かれた記録（固定の議題・繰り越し・Canvas）を孤児にしない）
+        """
+        from botocore.exceptions import ClientError
+
+        try:
+            self.tables["meetings"].update_item(
+                Key={"meeting_id": meeting_id},
+                UpdateExpression=f"SET {DELETING_ATTRIBUTE} = :t",
+                ConditionExpression="attribute_exists(meeting_id)",
+                ExpressionAttributeValues={":t": True},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise  # 会議が無い（前回の削除が途中で止まった）ときは、残った子の記録だけを消す
+        self._delete_children(meeting_id)
+        self.tables["meetings"].delete_item(Key={"meeting_id": meeting_id})
+        self._delete_children(meeting_id)
+
+    def _delete_children(self, meeting_id: str) -> None:
         for table in ("fixed_items", "drafts", "canvases"):
             spec = TABLES[table]
             with self.tables[table].batch_writer() as batch:
                 for item in self._query(table, meeting_id):
                     batch.delete_item(Key={spec["pk"]: item[spec["pk"]], spec["sk"]: item[spec["sk"]]})
-        self.tables["meetings"].delete_item(Key={"meeting_id": meeting_id})
 
     def meetings_in_channel(self, channel_id: str) -> list[Meeting]:
         """チャンネルの会議. GSI channel_id-index を Query する（そのチャンネルの会議だけを読む）.
@@ -350,7 +401,8 @@ class DynamoRepository:
     def put_draft_if_schedule(self, d: DraftItem, schedule_version: int) -> bool:
         """会議があり、その schedule_version が渡した版のままのときだけ議題を書く（TransactWriteItems: 会議の条件確認と議題の Put を 1 回で）.
 
-        会議の変更（update_schedule）と同時に出された議題が、古い開催日に残らないようにする。書けたら True.
+        会議の変更（update_schedule）と同時に出された議題が、古い開催日に残らないようにする。削除中（delete_meeting が印を付けた）の
+        会議にも書かない（削除と同時に出された議題が、会議の無い孤児として残らないように）。書けたら True.
         """
         from botocore.exceptions import ClientError
 
@@ -362,7 +414,8 @@ class DynamoRepository:
                         "ConditionCheck": {
                             "TableName": self.tables["meetings"].name,
                             "Key": {"meeting_id": d.meeting_id},
-                            "ConditionExpression": "attribute_exists(meeting_id) AND " + _version_condition(schedule_version),
+                            "ConditionExpression": f"attribute_exists(meeting_id) AND attribute_not_exists({DELETING_ATTRIBUTE}) AND "
+                            + _version_condition(schedule_version),
                             "ExpressionAttributeValues": {":v": schedule_version},
                         }
                     },
@@ -390,7 +443,7 @@ class DynamoRepository:
                 "ボットのロールに権限を足してください（docs/setup.md）"
             )
         v = self.tables["meetings"].get_item(Key={"meeting_id": d.meeting_id}, ConsistentRead=True).get("Item")
-        if v is None or int(v.get("schedule_version", 0)) != schedule_version:
+        if v is None or v.get(DELETING_ATTRIBUTE) or int(v.get("schedule_version", 0)) != schedule_version:
             return False
         self.put_draft(d)
         return True

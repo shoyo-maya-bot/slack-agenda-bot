@@ -337,7 +337,7 @@ def test_show_offers_finalize_and_cancel_to_admins_only(repo, meeting):
     respond = Recorder()
     h.show(ack=Recorder(), action={"value": meeting.meeting_id}, body=body(MEMBER), respond=respond)
     assert not {views.A_FINALIZE, views.A_CANCEL} & set(_actions(respond.last["blocks"]))
-    assert "担当者が選びます" in str(respond.last["blocks"])
+    assert "確定・中止を選べるのは、担当者" in str(respond.last["blocks"])
     assert repo.drafts(meeting.meeting_id, "2026-10-05")[0].status == "proposed"  # 見ただけでは変わらない
 
 

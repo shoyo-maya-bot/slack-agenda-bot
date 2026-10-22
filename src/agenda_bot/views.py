@@ -28,6 +28,12 @@ MAX_MESSAGE_BLOCKS = 50  # メッセージ（chat.postMessage・respond）のブ
 MAX_MODAL_BLOCKS = 100  # モーダルのブロック数
 MAX_TEXT = 3000  # section・context の mrkdwn の文字数
 
+# 担当者でない人への案内（AGENDA_ADMINS が空なら会議の登録者. 登録者がいなくなったときの引き継ぎ方も書く）
+NOT_MANAGER_NOTE = (
+    "{what}のは、担当者（AGENDA_ADMINS。空なら会議の登録者）だけです。"
+    "登録者が異動・退職するときは、登録者か担当者（AGENDA_ADMINS）が「会議の変更」で登録者を引き継げます。"
+)
+
 
 def clip(text: str, limit: int = MAX_TEXT) -> str:
     """文字数の上限に収める（超えたら末尾を「…」にする）."""
@@ -153,7 +159,7 @@ def register_modal() -> dict[str, Any]:
 
 
 def edit_meeting_modal(meeting: Meeting) -> dict[str, Any]:
-    """会議の変更（曜日・時刻・長さ）. 今の値を初期値に入れる."""
+    """会議の変更（曜日・時刻・長さ・登録者の引き継ぎ）. 今の値を初期値に入れる."""
     days = [{"text": {"type": "plain_text", "text": f"{w}曜"}, "value": str(i)} for i, w in enumerate(WEEKDAYS)]
     return {
         "type": "modal",
@@ -171,8 +177,21 @@ def edit_meeting_modal(meeting: Meeting) -> dict[str, Any]:
             ),
             _input("time", "開始時刻", _text("v", meeting.time)),
             _input("minutes", "会議時間（分）", _text("v", str(meeting.default_minutes))),
+            _input(
+                "owner",
+                "会議の登録者",
+                _owner_select(meeting.owner),
+                hint="別の人を選ぶと、登録者を引き継ぎます（AGENDA_ADMINS が空なら、確定・中止・Canvas・固定の議題はこの人だけができます）",
+            ),
         ],
     }
+
+
+def _owner_select(owner: str) -> dict[str, Any]:
+    e: dict[str, Any] = {"type": "users_select", "action_id": "v"}
+    if is_user_id(owner):
+        e["initial_user"] = owner
+    return e
 
 
 def draft_modal(meeting: Meeting, meeting_date: str) -> dict[str, Any]:
@@ -224,9 +243,7 @@ def fixed_modal(meeting: Meeting, items: list, can_manage: bool = True) -> dict[
             _input("minutes", "時間（分）", _text("v", "5")),
         ]
     else:
-        blocks.append(
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": "固定の議題を変えられるのは、設定された担当者だけです。"}]}
-        )
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": NOT_MANAGER_NOTE.format(what="固定の議題を変えられる")}]})
     return modal
 
 
@@ -254,7 +271,7 @@ def settle_blocks(view: AgendaView, can_manage: bool) -> list[dict[str, Any]]:
             }
         )
     else:
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "確定・中止は、設定された担当者が選びます。"}]})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": NOT_MANAGER_NOTE.format(what="確定・中止を選べる")}]})
     return blocks
 
 

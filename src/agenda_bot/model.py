@@ -137,9 +137,14 @@ def to_dict(obj) -> dict:
 def build_agenda(
     meeting: Meeting, meeting_date: date, fixed: list[FixedItem], drafts: list[DraftItem]
 ) -> tuple[list[dict], int, list[DraftItem]]:
-    """固定議題 → 前の会議から繰り越した議題 → 出された議題（受付順）の順に並べ、会議時間に収まらない議題は「次回へ」に回す.
+    """アジェンダを組む（README の「アジェンダの組み方」と同じ決まり）.
 
-    取り下げ済み（accepted）の議題は並べない。
+    1. 固定の議題を order（同じなら議題名）の順にすべて並べる（会議時間を超えても並べる）
+    2. 繰り越した議題（status=deferred）を、最初の開催日（carried_from）の古い順 → 出した順（created_at）に
+    3. 新しく出た議題を、出した順（created_at）に
+    2・3 は前から順に、合計が会議時間を超えない議題だけを並べ、超える議題は「次回へ」に回す。回した後も後ろの議題は続けて試すので、
+    後に出た短い議題が、先に出た長い議題より先に入ることがある（先頭から詰める first-fit）。
+    扱い済み（accepted）の議題は並べない。
     戻り値: (並べた議題, 合計の分, 次回へ回した議題)
     """
     rows: list[dict] = []

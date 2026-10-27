@@ -9,7 +9,8 @@
 - 保存先を増やす・変えるときは `MemoryRepository` と `DynamoRepository` の両方を同じ動きにし、テストは両方で通す（DynamoDB は moto）
 - テーブル・GSI・TTL を変えたら `repository.TABLES`・`create_tables`、`docs/setup.md` の表と IAM の権限、CI の DynamoDB Local のジョブを合わせる。
   既にあるテーブルでも `scripts/create_tables.py` をもう一度実行すれば追いつくようにする（作り直させない）
-- 同時に押される操作（議題の追加・会議の変更・確定・Canvas の作成）は、条件付きの書き込みで競合を防ぐ。読み直してから書くだけにしない
+- 同時に押される操作（議題の追加・会議の変更・登録者の引き継ぎ・会議の削除・確定・Canvas の作成）は、条件付きの書き込みで競合を防ぐ。読み直してから書くだけにしない
+- README・docs/setup.md・`.env.example` に書いた値（版・上限・既定値・テーブル・環境変数）を変えたら、`tests/test_round7.py` が通るように文書も直す
 
 ## 検査（CI と同じ）
 

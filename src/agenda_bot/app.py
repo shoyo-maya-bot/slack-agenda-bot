@@ -127,8 +127,11 @@ def now_in(tz: str | None = None) -> Callable[[], datetime]:
 
 
 NOT_FOUND = "その会議は見つかりません（削除されたか、別のワークスペースのものかもしれません）。`/agenda` からやり直してください。"
-NOT_ALLOWED = "この操作（固定の議題・Canvas への出力・会議の確定と中止）ができるのは、担当者（AGENDA_ADMINS。空なら会議の登録者）だけです。"
-NOT_ALLOWED_EDIT = "会議の変更・削除ができるのは、会議の登録者と担当者（AGENDA_ADMINS）だけです。"
+NOT_ALLOWED = (
+    "この操作（固定の議題・Canvas への出力・会議の確定と中止）ができるのは、担当者（AGENDA_ADMINS。空なら会議の登録者）だけです。"
+    "登録者が異動・退職したときは、担当者（AGENDA_ADMINS）が「会議の変更」で登録者を引き継げます（docs/setup.md）。"
+)
+NOT_ALLOWED_EDIT = "会議の変更（登録者の引き継ぎを含む）・削除ができるのは、会議の登録者と担当者（AGENDA_ADMINS）だけです。"
 NOT_ALLOWED_REGISTER = "会議を登録できるのは、設定された担当者（AGENDA_ADMINS）だけです。"
 
 
@@ -380,18 +383,37 @@ class Handlers:
             ack(**views.errors(service.ValidationError("minutes", NOT_FOUND)))
             return
         v = views.values(view)
+        user = body["user"]["id"]
+        new_owner = v.get("owner", "").strip()
+        transfer = bool(new_owner) and new_owner != m.owner
+        # 登録者の引き継ぎだけ（曜日・時刻・長さはそのまま）なら予定は書き換えない（確定していない過去の会議があっても引き継げる）
+        entered = (v.get("weekday", ""), v.get("time", "").strip(), v.get("minutes", "").strip())
+        same = entered == (str(m.weekday), m.time, str(m.default_minutes))
+        moved = []
         try:
-            new, moved = service.update_meeting(
-                self.repo, m, body["user"]["id"], v.get("weekday", ""), v.get("time", ""), v.get("minutes", ""), self.now(), self.admins
-            )
+            if transfer and same:
+                if not service.can_edit_meeting(m, user, self.admins):
+                    raise service.ValidationError("owner", NOT_ALLOWED_EDIT)
+                new = m
+            else:
+                new, moved = service.update_meeting(
+                    self.repo, m, user, v.get("weekday", ""), v.get("time", ""), v.get("minutes", ""), self.now(), self.admins
+                )
+            if transfer:
+                new = service.transfer_meeting(self.repo, new, user, new_owner, self.admins)
         except service.ValidationError as e:
             ack(**views.errors(e))
             return
         ack()
-        note = (
-            f"<@{body['user']['id']}> さんが会議「{views.esc(new.name)}」を変更しました"
-            f"（毎週{views.WEEKDAYS[new.weekday]}曜 {new.time}〜、{new.default_minutes} 分）。"
-        )
+        if transfer and same:
+            note = f"<@{user}> さんが会議「{views.esc(new.name)}」の登録者を <@{new.owner}> さんに引き継ぎました。"
+        else:
+            note = (
+                f"<@{user}> さんが会議「{views.esc(new.name)}」を変更しました"
+                f"（毎週{views.WEEKDAYS[new.weekday]}曜 {new.time}〜、{new.default_minutes} 分）。"
+            )
+            if transfer:
+                note += f" 登録者を <@{new.owner}> さんに引き継ぎました。"
         if moved:
             note += f" 議題 {len(moved)} 件の開催日を付け替えました。"
         for warning in (service.fill_warning(self.repo, new), service.unfit_warning(self.repo, new)):
@@ -584,7 +606,7 @@ def main() -> None:
         "timezone: %s / canvas mode: %s / admins: %s / error channel: %s",
         tz.key,
         mode,
-        len(admins) or "全員",
+        len(admins) or "なし（確定・中止などは各会議の登録者）",
         "あり" if error_channel else "なし",
     )
     from slack_bolt.adapter.socket_mode import SocketModeHandler

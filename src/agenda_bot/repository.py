@@ -6,7 +6,7 @@
 | meetings | meeting_id | - | 会議（チャンネル・曜日・時刻・時間）. GSI channel_id-index（channel_id）で /agenda のチャンネルの会議を引く |
 | fixed_items | meeting_id | item_id | 固定議題 |
 | drafts | meeting_id | sk = 開催日#item_id | 次回に向けて出された議題（扱い済みは TTL 属性 expires_at で消える） |
-| canvases | meeting_id | meeting_date | 開催日ごとの Canvas の ID |
+| canvases | meeting_id | meeting_date | 開催日ごとの Canvas の ID（CANVAS_MODE=channel は channel#<チャンネル ID> + channel） |
 """
 
 from __future__ import annotations

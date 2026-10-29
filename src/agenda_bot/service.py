@@ -531,19 +531,41 @@ def _slack_error(e: Exception) -> str:
         return ""
 
 
+CHANNEL_CANVAS_DATE = "channel"  # CANVAS_MODE=channel の記録の meeting_date（開催日によらず 1 つ）
+
+
+def channel_canvas_key(channel_id: str) -> str:
+    """CANVAS_MODE=channel の記録の meeting_id. チャンネルの Canvas は 1 チャンネルに 1 つなので、会議ではなくチャンネルで記録する
+
+    （同じチャンネルの 2 つ目の会議が新しく作ろうとして channel_canvas_already_exists にならないように）。
+    """
+    return f"channel#{channel_id}"
+
+
+def _canvas_owner(meeting: Meeting, mode: str) -> str:
+    return channel_canvas_key(meeting.channel_id) if mode == "channel" else meeting.meeting_id
+
+
 def _create_canvas(repo: Repository, client: CanvasApi, meeting: Meeting, view: AgendaView, key_date: str, mode: str) -> str:
     """「作成中」の印を書けた人だけが呼ぶ. Canvas を作り、ID を保存してから権限を付ける. → Canvas の ID."""
     content = {"type": "markdown", "markdown": view.markdown}
+    owner = _canvas_owner(meeting, mode)
     try:
         if mode == "channel":
             res = client.conversations_canvases_create(channel_id=meeting.channel_id, document_content=content)
         else:
             res = client.canvases_create(title=f"{meeting.name} {view.meeting_date.isoformat()}", document_content=content)
-    except Exception:
-        repo.delete_canvas(meeting.meeting_id, key_date)  # 作れなかったので印を消し、もう一度押せるようにする
+    except Exception as e:
+        repo.delete_canvas(owner, key_date)  # 作れなかったので印を消し、もう一度押せるようにする
+        if _slack_error(e) == "channel_canvas_already_exists":
+            raise ValidationError(
+                "canvas",
+                "このチャンネルには、ボットが記録していない Canvas が既にあります（手で作った・以前の版のボットが別の会議で作った、など）。"
+                "チャンネルの Canvas を消すか、CANVAS_MODE=standalone にしてください（docs/setup.md の「Canvas とプラン」）",
+            ) from e
         raise
     canvas_id = res["canvas_id"]
-    _save_created(repo, client, CanvasRecord(meeting.meeting_id, key_date, canvas_id), mode)  # 権限の付与より先に保存する
+    _save_created(repo, client, CanvasRecord(owner, key_date, canvas_id), mode)  # 権限の付与より先に保存する
     if mode != "channel":
         client.canvases_access_set(canvas_id=canvas_id, access_level="write", channel_ids=[meeting.channel_id])
     return canvas_id
@@ -555,23 +577,36 @@ def publish_canvas(
     """アジェンダを Canvas に書く. 同じ開催日の Canvas があれば中身を置き換える. → (Canvas の ID, 新しく作ったか).
 
     mode=standalone: 開催日ごとに Canvas を作り、チャンネルに編集権限を付ける（有料プラン向け）
-    mode=channel: チャンネルの Canvas（1 チャンネルに 1 つ）を毎回置き換える（API で作るので有料プランが必要. docs/setup.md）
+    mode=channel: チャンネルの Canvas（1 チャンネルに 1 つ）を毎回置き換える（API で作るので有料プランが必要. docs/setup.md）。
+      記録はチャンネル単位（channel_canvas_key）なので、同じチャンネルの会議は同じ Canvas を使い、最後に出した会議の内容になる
 
     重複を防ぐため、作る前に「作成中」の印を条件付きで書き（先に書けた 1 人だけが作る）、作った直後に ID を保存してから権限を付ける。
     権限の付与に失敗しても ID は残るので、もう一度押すと同じ Canvas を更新し、権限を付け直す。
     記録した Canvas が Slack 側で消されていた（canvas_not_found）ときは、記録を「作成中」の印に置き換えてから作り直す。
     """
     view = agenda(repo, meeting, today)
-    key_date = view.meeting_date.isoformat() if mode == "standalone" else "channel"
+    key_date = view.meeting_date.isoformat() if mode == "standalone" else CHANNEL_CANVAS_DATE
+    owner = _canvas_owner(meeting, mode)
     content = {"type": "markdown", "markdown": view.markdown}
-    rec = repo.get_canvas(meeting.meeting_id, key_date)
+    rec = repo.get_canvas(owner, key_date)
+    if rec is None and mode == "channel":
+        # 以前の版は会議ごとに記録していた（meeting_id + "channel"）. このチャンネルのどれかの会議の記録があれば、チャンネルの記録に写して使う
+        ids = [meeting.meeting_id] + [
+            x.meeting_id for x in repo.meetings_in_channel(meeting.channel_id) if x.meeting_id != meeting.meeting_id
+        ]
+        for mid in ids:
+            legacy = repo.get_canvas(mid, key_date)
+            if legacy is not None and legacy.canvas_id != PENDING:
+                repo.put_canvas_if(CanvasRecord(owner, key_date, legacy.canvas_id), None)
+                rec = repo.get_canvas(owner, key_date)
+                break
     if rec is None or rec.canvas_id == PENDING:
         if rec is not None and not _stale(rec):
             raise Busy("canvas", "Canvas を作成中です。少し待ってから、もう一度押してください")
-        claim = CanvasRecord(meeting.meeting_id, key_date, PENDING)
+        claim = CanvasRecord(owner, key_date, PENDING)
         if repo.put_canvas_if(claim, rec):
             return _create_canvas(repo, client, meeting, view, key_date, mode), True
-        rec = repo.get_canvas(meeting.meeting_id, key_date)
+        rec = repo.get_canvas(owner, key_date)
         if rec is None or rec.canvas_id == PENDING:
             raise Busy("canvas", "Canvas を作成中です。少し待ってから、もう一度押してください")
     try:
@@ -583,8 +618,8 @@ def publish_canvas(
             raise
         log.warning("記録した Canvas %s が見つかりません（Slack で削除された）. 記録を消して作り直します", rec.canvas_id)
         # 記録が読んだときのままなら「作成中」の印に置き換える（同時に押した人のうち 1 人だけが作り直す）
-        if not repo.put_canvas_if(CanvasRecord(meeting.meeting_id, key_date, PENDING), rec):
+        if not repo.put_canvas_if(CanvasRecord(owner, key_date, PENDING), rec):
             raise Busy("canvas", "Canvas を作り直しています。少し待ってから、もう一度押してください") from e
         return _create_canvas(repo, client, meeting, view, key_date, mode), True
-    repo.put_canvas(CanvasRecord(meeting.meeting_id, key_date, rec.canvas_id))
+    repo.put_canvas(CanvasRecord(owner, key_date, rec.canvas_id))
     return rec.canvas_id, False

@@ -6,6 +6,10 @@ features:
   bot_user:
     display_name: アジェンダ係
     always_online: false
+  app_home:                   # チャンネルにお知らせを投稿できなかったとき、本人に DM（メッセージタブ）で知らせる
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: true
   slash_commands:
     - command: /agenda
       description: 議題を出す・次回のアジェンダを見る・Canvas に出す

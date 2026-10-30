@@ -71,7 +71,9 @@ def test_canvas_not_found_recreates(repo, meeting, mode, key):
     c = GoneCanvas({"F_OLD"})
     canvas_id, created = service.publish_canvas(repo, c, meeting, TODAY, mode)
     assert created is True and canvas_id != "F_OLD"
-    assert repo.get_canvas(meeting.meeting_id, key).canvas_id == canvas_id  # 新しい ID を記録する
+    # 新しい ID を記録する（channel はチャンネル単位の記録。以前の版の会議単位の記録から写して使う）
+    owner = service.channel_canvas_key(meeting.channel_id) if mode == "channel" else meeting.meeting_id
+    assert repo.get_canvas(owner, key).canvas_id == canvas_id
     assert [k for k, _ in c.calls][0] == "edit"
     # 次は新しい Canvas を更新する（もう作らない）
     assert service.publish_canvas(repo, c, meeting, TODAY, mode) == (canvas_id, False)

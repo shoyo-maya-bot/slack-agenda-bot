@@ -5,11 +5,12 @@
 1. https://api.slack.com/apps → **Create New App** → **From a manifest** → ワークスペースを選び、`manifest.yml` の中身を貼る
 2. **Basic Information → App-Level Tokens** で `connections:write` のトークンを作る → `.env` の `SLACK_APP_TOKEN`（xapp-…）
 3. **Install App** でワークスペースに入れる → **OAuth & Permissions** の Bot User OAuth Token → `.env` の `SLACK_BOT_TOKEN`（xoxb-…）
-4. 使うチャンネルにアプリを招待する（`/invite @アジェンダ係`）
+4. 使うチャンネルにアプリを招待する（`/invite @アジェンダ係`）。招待していないチャンネルでも `/agenda` は開けますが、登録・議題などのお知らせを投稿できません。
+   そのときは保存はしたうえで、操作した本人にボットとの DM（アプリの「メッセージ」タブ）で「お知らせを投稿できませんでした」と送ります（やり直すと二重に登録されるので、やり直さずに招待してください）
 
 アプリの追加にワークスペースの管理者の承認が要る場合があります。社内のルールに従ってください。
 トークンは `.env` にだけ書き、コミット・チャットへの貼り付けをしないでください。
-`.env` のコメントは値の前の行に書いてください（値の後ろの ` # …` は外して読みますが、値に ` #` を含めるなら `"…"` で囲みます）。
+`.env` の書き方: コメントは値の前の行に書く。値の後ろの「 #」（空白と #）から後ろは外して読む（値に「 #」を含めるなら "…" で囲む。a#b のように空白の無い # は値の一部）。
 
 ### 操作できる人（AGENDA_ADMINS）
 
@@ -38,7 +39,7 @@ Canvas を API で作る・更新するには Slack の **有料プラン** が�
 | CANVAS_MODE | 動き | 必要なもの |
 |---|---|---|
 | `message`（既定） | アジェンダをチャンネルにメッセージで投稿 | なし（無料プランでも可） |
-| `channel` | チャンネルの Canvas（1 チャンネル 1 つ）を毎回置き換える | 有料プラン、`canvases:write`。チャンネルに Canvas が既にあると `channel_canvas_already_exists` |
+| `channel` | チャンネルの Canvas（1 チャンネル 1 つ）を毎回置き換える。同じチャンネルに会議が 2 つ以上あると、同じ Canvas を共有し、最後に「Canvas に出す」を押した会議のアジェンダになる | 有料プラン、`canvases:write`。ボットが記録していない Canvas（手で作ったものなど）がチャンネルに既にあると作れない（`channel_canvas_already_exists`。消すか `standalone` にする） |
 | `standalone` | 開催日ごとに Canvas を作り、チャンネルに編集権限を付ける | 有料プラン、`canvases:write` |
 
 Canvas は、作った直後に ID を保存してから権限を付けます。ID の保存が何度やっても失敗したときは、作った Canvas を消して「もう一度押してください」と出します
@@ -95,7 +96,7 @@ python scripts/create_tables.py          # .env の DYNAMODB_ENDPOINT（http://l
 | `agenda_meetings` | meeting_id（GSI `channel_id-index`: channel_id） | 会議（チャンネル・曜日・時刻・時間・登録者 `owner`・予定の版 `schedule_version`・削除中の印 `deleting`） |
 | `agenda_fixed_items` | meeting_id + item_id | 固定の議題 |
 | `agenda_drafts` | meeting_id + sk（開催日#item_id） | 出された議題（status: proposed / accepted＝扱い済み / deferred＝繰り越し）。TTL 属性 `expires_at` |
-| `agenda_canvases` | meeting_id + meeting_date | 開催日ごとの Canvas の ID（空は作成中） |
+| `agenda_canvases` | meeting_id + meeting_date | 開催日ごとの Canvas の ID（空は作成中）。`CANVAS_MODE=channel` はチャンネルごとに 1 つ（meeting_id が `channel#<チャンネル ID>`、meeting_date が `channel`。以前の版の会議ごとの記録は、次に Canvas に出したときに写して使う） |
 
 ### チャンネルの会議の一覧（GSI）
 

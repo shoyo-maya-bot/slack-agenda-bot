@@ -167,6 +167,29 @@ class Handlers:
     def _say(respond, text: str) -> None:
         respond(response_type="ephemeral", replace_original=False, text=text)
 
+    @staticmethod
+    def _announce(client, channel: str, user: str, text: str, done: str, **kw) -> bool:
+        """保存が済んだ後のチャンネルへのお知らせ. 投稿に失敗しても（ボットが招待されていない not_in_channel など）、例外にしない.
+
+        例外にすると「エラーが起きました」と出て、押した人がやり直し、会議や議題が二重に登録される。
+        代わりに、押した本人にボットとの DM で「done（保存は済んでいる）」と、お知らせできなかった理由を送る。→ 投稿できたか.
+        """
+        try:
+            client.chat_postMessage(channel=channel, text=text, **kw)
+            return True
+        except Exception as e:  # noqa: BLE001 — Slack の権限・招待の誤り. 保存は済んでいるので処理は成功として扱う
+            code = service._slack_error(e) or type(e).__name__
+            log.warning("チャンネル %s に投稿できませんでした（%s）", channel, code)
+            note = (
+                f"{done} ただし、チャンネル <#{channel}> にお知らせを投稿できませんでした（{code}）。"
+                "やり直す必要はありません。ボットをチャンネルに招待してください（`/invite @アジェンダ係`）。"
+            )
+            try:
+                client.chat_postMessage(channel=user, text=note)
+            except Exception:  # noqa: BLE001
+                log.warning("本人（%s）にも知らせられませんでした", user, exc_info=True)
+            return False
+
     # --- /agenda ---
 
     def agenda_command(self, ack, command, respond):
@@ -197,7 +220,8 @@ class Handlers:
             ack(**views.errors(e))
             return
         ack()
-        client.chat_postMessage(channel=m.channel_id, text=f"会議「{views.esc(m.name)}」を登録しました。`/agenda` から議題を出せます。")
+        done = f"会議「{views.esc(m.name)}」を登録しました。"
+        self._announce(client, m.channel_id, body["user"]["id"], f"{done}`/agenda` から議題を出せます。", done)
 
     # --- 議題 ---
 
@@ -230,9 +254,12 @@ class Handlers:
             ack(**views.errors(e))
             return
         ack()
-        client.chat_postMessage(
-            channel=m.channel_id,
-            text=f"<@{d.created_by}> さんが {d.meeting_date} の議題を出しました: *{views.esc(d.title)}*（{d.minutes} 分）",
+        self._announce(
+            client,
+            m.channel_id,
+            d.created_by,
+            f"<@{d.created_by}> さんが {d.meeting_date} の議題を出しました: *{views.esc(d.title)}*（{d.minutes} 分）",
+            f"{d.meeting_date} の議題「{views.esc(d.title)}」を出しました。",
         )
 
     def show(self, ack, action, body, respond):
@@ -296,7 +323,7 @@ class Handlers:
             + views.agenda_blocks(service.agenda(self.repo, m, self.now()), "", True, max_blocks=views.MAX_MESSAGE_BLOCKS - 1),
             text=note,
         )
-        client.chat_postMessage(channel=m.channel_id, text=f"<@{body['user']['id']}> さん: {views.esc(m.name)} の {note}")
+        self._announce(client, m.channel_id, body["user"]["id"], f"<@{body['user']['id']}> さん: {views.esc(m.name)} の {note}", note)
 
     def finalize(self, ack, action, body, respond, client):
         self._settle(ack, action, body, respond, client, "finalize")
@@ -419,7 +446,7 @@ class Handlers:
         for warning in (service.fill_warning(self.repo, new), service.unfit_warning(self.repo, new)):
             if warning:  # 会議を短くして収まらなくなった議題は、出した人にメンションで知らせる（変更は拒否しない）
                 note += f"\n:warning: {warning}"
-        client.chat_postMessage(channel=new.channel_id, text=views.clip(note))
+        self._announce(client, new.channel_id, user, views.clip(note), f"会議「{views.esc(new.name)}」の変更を保存しました。")
 
     def delete_meeting(self, ack, body, client, action, respond):
         ack()
@@ -439,7 +466,13 @@ class Handlers:
             blocks=views.menu([x for x in self.repo.meetings_in_channel(m.channel_id) if x.meeting_id != m.meeting_id]),
             text="会議を削除しました",
         )
-        client.chat_postMessage(channel=m.channel_id, text=f"<@{body['user']['id']}> さんが会議「{views.esc(m.name)}」を削除しました。")
+        self._announce(
+            client,
+            m.channel_id,
+            body["user"]["id"],
+            f"<@{body['user']['id']}> さんが会議「{views.esc(m.name)}」を削除しました。",
+            f"会議「{views.esc(m.name)}」を削除しました。",
+        )
 
     # --- Canvas ---
 
@@ -454,7 +487,15 @@ class Handlers:
             return
         if self.canvas_mode == "message":  # Canvas を使えないプラン向け: チャンネルにアジェンダを投稿する
             v = service.agenda(self.repo, m, self.now())
-            client.chat_postMessage(channel=m.channel_id, blocks=views.agenda_blocks(v, ""), text=f"{views.esc(m.name)} のアジェンダ")
+            try:
+                client.chat_postMessage(channel=m.channel_id, blocks=views.agenda_blocks(v, ""), text=f"{views.esc(m.name)} のアジェンダ")
+            except Exception as e:  # noqa: BLE001 — not_in_channel など. 何も保存していないので、理由を本人に伝える
+                code = service._slack_error(e) or type(e).__name__
+                log.warning("チャンネル %s に投稿できませんでした（%s）", m.channel_id, code)
+                self._say(
+                    respond,
+                    f"チャンネルにアジェンダを投稿できませんでした（{code}）。ボットをチャンネルに招待してください（`/invite @アジェンダ係`）。",
+                )
             return
         try:
             canvas_id, created = service.publish_canvas(self.repo, client, m, self.now(), self.canvas_mode)
@@ -466,7 +507,8 @@ class Handlers:
             self._say(respond, f"Canvas に出せませんでした: {e}（docs/setup.md の権限とプランを確認してください）")
             return
         word = "作りました" if created else "更新しました"
-        client.chat_postMessage(channel=m.channel_id, text=f"{views.esc(m.name)} のアジェンダを Canvas に{word}（ID: {canvas_id}）。")
+        text = f"{views.esc(m.name)} のアジェンダを Canvas に{word}（ID: {canvas_id}）。"
+        self._announce(client, m.channel_id, body["user"]["id"], text, text)
 
 
 ERROR_TEXT = "処理中にエラーが起きました。少し待ってから、もう一度試してください（続くときはボットの管理者に連絡してください）。"
